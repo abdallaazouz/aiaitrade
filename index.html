@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IQ AI Analyzer — لوحة التحليل والتنبؤ السحابية</title>
+  <title>IQ AI Analyzer v4 — التعلم من الأخطاء + OTC</title>
   <style>
     :root {
       --bg: #0b1220; --card: #121c2e; --border: #1f2e47;
@@ -12,50 +12,53 @@
     }
     * { box-sizing: border-box; font-family: "Segoe UI", Tahoma, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 14px; }
-    .container { max-width: 1120px; margin: 0 auto; display: grid; gap: 12px; }
-    .card {
-      background: var(--card); border: 1px solid var(--border);
-      border-radius: 12px; padding: 14px;
-    }
-    h1 { margin: 0 0 8px; font-size: 1.25rem; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+    .container { max-width: 1160px; margin: 0 auto; display: grid; gap: 12px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
+    h1 { margin: 0 0 8px; font-size: 1.2rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     input, select, button {
       background: #0d1524; color: var(--text); border: 1px solid var(--border);
-      border-radius: 8px; padding: 8px 10px; font-size: 0.9rem;
+      border-radius: 8px; padding: 8px 10px; font-size: 0.88rem;
     }
     button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
     button.secondary { background: #1e293b; border-color: #334155; }
+    button.otc { background: #7c3aed; border-color: #7c3aed; }
     button.danger { background: #991b1b; border-color: #b91c1c; }
-    button:hover { opacity: 0.92; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; }
     .stat { background: #0d1524; border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
-    .stat .label { color: var(--muted); font-size: 0.8rem; }
-    .stat .val { font-size: 1.1rem; font-weight: 700; margin-top: 4px; }
+    .stat .label { color: var(--muted); font-size: 0.78rem; }
+    .stat .val { font-size: 1.05rem; font-weight: 700; margin-top: 4px; }
     .banner {
-      padding: 14px; border-radius: 10px; font-size: 1.05rem; font-weight: 700;
+      padding: 14px; border-radius: 10px; font-size: 1.02rem; font-weight: 700;
       background: #0d1524; border-right: 5px solid var(--accent);
     }
     .banner.up { border-right-color: var(--up); color: #6ee7b7; }
     .banner.down { border-right-color: var(--down); color: #fca5a5; }
+    .banner.neutral { border-right-color: var(--warn); color: #fcd34d; }
     table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-    th, td { padding: 10px; text-align: center; border-bottom: 1px solid var(--border); }
-    th { color: var(--muted); font-size: 0.85rem; }
+    th, td { padding: 9px; text-align: center; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+    th { color: var(--muted); font-size: 0.82rem; }
     .badge-up { color: var(--up); font-weight: 700; }
     .badge-down { color: var(--down); font-weight: 700; }
-    canvas { width: 100%; height: 180px; background: #09101c; border-radius: 8px; display: block; }
+    .pair-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
+    .pill {
+      background: #0d1524; border: 1px solid var(--border); border-radius: 8px;
+      padding: 6px 10px; font-size: 0.84rem;
+    }
+    canvas { width: 100%; height: 170px; background: #09101c; border-radius: 8px; display: block; }
     .logs {
       background: #070c15; border: 1px solid var(--border); border-radius: 8px;
-      padding: 10px; height: 190px; overflow-y: auto; font-family: monospace;
-      font-size: 0.82rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap;
+      padding: 10px; height: 185px; overflow-y: auto; font-family: monospace;
+      font-size: 0.81rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap;
     }
-    .muted { color: var(--muted); font-size: 0.82rem; }
+    .muted { color: var(--muted); font-size: 0.8rem; }
   </style>
 </head>
 <body>
 <div class="container">
   <div class="card">
     <h1>
-      <span>📊 IQ AI Analyzer — ويب سحابي مجاني</span>
+      <span>🧠 IQ AI Analyzer v4 — التعلّم من الأخطاء + نظام OTC</span>
       <span id="connBadge" class="muted">غير متصل</span>
     </h1>
     <div class="row">
@@ -70,20 +73,27 @@
       <div class="row">
         <label>الزوج:</label>
         <select id="pairSelect">
-          <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
-          <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
-          <option>NZDUSD</option><option>EURUSD-OTC</option><option>GBPUSD-OTC</option>
-          <option>USDJPY-OTC</option>
+          <optgroup label="السوق العادي (أيام العمل)">
+            <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
+            <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
+            <option>NZDUSD</option><option>EURJPY</option><option>EURGBP</option><option>GBPJPY</option>
+          </optgroup>
+          <optgroup label="نظام OTC (العطلات ونهاية الأسبوع)">
+            <option>EURUSD-OTC</option><option>GBPUSD-OTC</option><option>USDJPY-OTC</option>
+            <option>USDCHF-OTC</option><option>USDCAD-OTC</option><option>AUDUSD-OTC</option>
+            <option>NZDUSD-OTC</option><option>EURJPY-OTC</option><option>EURGBP-OTC</option><option>GBPJPY-OTC</option>
+          </optgroup>
         </select>
-        <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تغيير الزوج</button>
-        <button onclick="sendCommand({train_now: true})">تدريب الآن</button>
-        <button class="danger" onclick="sendCommand({stop: true})">إيقاف المحرك</button>
+        <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق الزوج</button>
+        <button class="otc" onclick="toggleOtcPair()">🔄 تبديل لـ OTC / عادي</button>
+        <button onclick="sendCommand({train_now: true})">تدريب وتصحيح الآن</button>
+        <button class="danger" onclick="sendCommand({stop: true})">إيقاف</button>
       </div>
       <div class="row">
         <label><input id="soundEnabled" type="checkbox" checked /> تنبيه صوتي</label>
-        <label>حد الثقة %:</label>
-        <input id="soundThreshold" type="number" value="70" min="50" max="99" style="width:70px;" />
-        <button class="secondary" onclick="unlockAndTestBeep()">🔊 تفعيل/تجربة الصوت</button>
+        <label>ثقة %:</label>
+        <input id="soundThreshold" type="number" value="65" min="50" max="99" style="width:65px;" />
+        <button class="secondary" onclick="unlockAndTestBeep()">🔊 الصوت</button>
       </div>
     </div>
   </div>
@@ -93,8 +103,8 @@
     <div class="stat"><div class="label">الزوج النشط</div><div id="stPair" class="val">—</div></div>
     <div class="stat"><div class="label">عدد الشموع</div><div id="stCandles" class="val">0</div></div>
     <div class="stat"><div class="label">آخر شمعة</div><div id="stLastCandle" class="val">—</div></div>
-    <div class="stat"><div class="label">فجوات البيانات</div><div id="stGaps" class="val">0</div></div>
-    <div class="stat"><div class="label">أداء التوقعات</div><div id="stPerf" class="val">—</div></div>
+    <div class="stat"><div class="label">نسبة نجاح العملة</div><div id="stPerf" class="val">—</div></div>
+    <div class="stat"><div class="label">أوزان التعلم الذاتي</div><div id="stSelfLearn" class="val">—</div></div>
   </div>
 
   <div class="card">
@@ -107,30 +117,32 @@
           <th>الزوج</th><th>الأفق</th>
           <th>اتجاه ML</th><th>نسبة ML</th>
           <th>اتجاه LSTM</th><th>نسبة LSTM</th>
+          <th>المدمج</th><th>دقة الأفق الفعلية</th>
         </tr>
       </thead>
       <tbody id="fcTableBody"></tbody>
     </table>
-
     <div id="fcDuration" style="margin-top:10px; font-weight:600; color:#93c5fd;"></div>
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">حركة السعر (آخر 60 شمعة إغلاق)</div>
-    <canvas id="priceChart" width="1000" height="180"></canvas>
+    <div class="muted">نسبة النجاح الفعلية لكل عملة (مقارنة التوقعات بالسعر الفعلي):</div>
+    <div id="pairPerfBox" class="pair-pills"><span class="muted">لم تُحسم توقعات بعد...</span></div>
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">سجل المحرك المباشر</div>
+    <div class="muted" style="margin-bottom:6px;">حركة السعر (آخر 60 شمعة إغلاق)</div>
+    <canvas id="priceChart" width="1000" height="170"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="muted" style="margin-bottom:6px;">سجل المحرك والتعلم من الأخطاء</div>
     <div id="logsBox" class="logs">لا توجد سجلات بعد...</div>
   </div>
 </div>
 
 <script>
-  let audioCtx = null;
-  let lastAlertKey = "";
-  let timer = null;
-
+  let audioCtx = null, lastAlertKey = "", timer = null;
   const apiUrlEl = document.getElementById("apiUrl");
   const apiTokenEl = document.getElementById("apiToken");
   const pairSelect = document.getElementById("pairSelect");
@@ -140,81 +152,56 @@
     apiTokenEl.value = localStorage.getItem("iq_api_token") || "";
     if (apiUrlEl.value && apiTokenEl.value) startPolling();
   }
-
   function saveConfig() {
     localStorage.setItem("iq_api_url", apiUrlEl.value.trim());
     localStorage.setItem("iq_api_token", apiTokenEl.value.trim());
     startPolling();
-    fetchState();
   }
-
+  function toggleOtcPair() {
+    let p = pairSelect.value;
+    p = p.endsWith("-OTC") ? p.replace("-OTC", "") : (p + "-OTC");
+    pairSelect.value = p;
+    sendCommand({ pair: p });
+  }
   function unlockAndTestBeep() {
-    try {
-      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-      if (audioCtx.state === "suspended") audioCtx.resume();
-      playBeep(880, 0.3);
-    } catch (e) {
-      alert("تعذر تشغيل الصوت: " + e.message);
-    }
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+    playBeep(880, 0.3);
   }
-
   function playBeep(freq = 880, dur = 0.35) {
     if (!audioCtx) return;
-    const osc = audioCtx.createOscillator();
-    const gain = audioCtx.createGain();
-    osc.type = "sine";
-    osc.frequency.value = freq;
+    const osc = audioCtx.createOscillator(), gain = audioCtx.createGain();
+    osc.type = "sine"; osc.frequency.value = freq;
     gain.gain.setValueAtTime(0.25, audioCtx.currentTime);
     gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
-    osc.connect(gain);
-    gain.connect(audioCtx.destination);
-    osc.start();
-    osc.stop(audioCtx.currentTime + dur);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(); osc.stop(audioCtx.currentTime + dur);
   }
-
   function startPolling() {
     if (timer) clearInterval(timer);
     fetchState();
-    timer = setInterval(fetchState, 4000);
+    timer = setInterval(fetchState, 5000);
   }
-
   async function fetchState() {
-    const url = apiUrlEl.value.trim();
-    const token = apiTokenEl.value.trim();
+    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
     if (!url || !token) return;
     try {
       const res = await fetch(`${url}?action=get_state&token=${encodeURIComponent(token)}`);
       const data = await res.json();
-      if (data.error) {
-        document.getElementById("connBadge").textContent = "خطأ: " + data.error;
-        return;
-      }
+      if (data.error) { document.getElementById("connBadge").textContent = "خطأ: " + data.error; return; }
       document.getElementById("connBadge").textContent = "متصل (" + new Date().toLocaleTimeString() + ")";
       renderState(data);
-    } catch (err) {
-      document.getElementById("connBadge").textContent = "فشل الاتصال";
-    }
+    } catch { document.getElementById("connBadge").textContent = "فشل الاتصال"; }
   }
-
   async function sendCommand(cmd) {
-    const url = apiUrlEl.value.trim();
-    const token = apiTokenEl.value.trim();
-    if (!url || !token) return alert("أدخل رابط Apps Script والـ Token أولًا.");
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "text/plain;charset=utf-8" },
-        body: JSON.stringify({ action: "command", token, ...cmd })
-      });
-      const data = await res.json();
-      if (data.ok) {
-        alert("تم إرسال الأمر إلى المحرك بنجاح (سينفذ خلال ثوانٍ).");
-      } else {
-        alert("خطأ: " + (data.error || "غير معروف"));
-      }
-    } catch (e) {
-      alert("فشل إرسال الأمر: " + e.message);
-    }
+    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
+    if (!url || !token) return alert("أدخل الرابط والـ Token أولًا.");
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "command", token, ...cmd })
+    });
+    const d = await res.json();
+    if (d.ok) alert("تم إرسال الأمر للمحرك.");
   }
 
   function renderState(s) {
@@ -222,13 +209,20 @@
     document.getElementById("stPair").textContent = s.pair || "—";
     document.getElementById("stCandles").textContent = (s.candle_count || 0).toLocaleString();
     document.getElementById("stLastCandle").textContent = s.last_candle_str || "—";
-    document.getElementById("stGaps").textContent = s.gaps ?? 0;
 
-    if (s.stats) {
-      const st = s.stats;
-      const rate = st.hit_rate !== null && st.hit_rate !== undefined ? st.hit_rate.toFixed(1) + "%" : "—";
-      document.getElementById("stPerf").textContent = `${st.hits}/${st.settled} (${rate}) | معلق ${st.pending}`;
-    }
+    const st = s.stats || {};
+    const rate = st.hit_rate !== null && st.hit_rate !== undefined ? st.hit_rate.toFixed(1) + "%" : "—";
+    document.getElementById("stPerf").textContent = st.settled ? `${st.hits}/${st.settled} (${rate})` : `معلق ${st.pending || 0}`;
+    document.getElementById("stSelfLearn").textContent = `أخطاء مصححة: ${st.mistakes || 0}`;
+
+    const byH = st.by_horizon || {};
+    const byPair = st.by_pair || [];
+    const pBox = document.getElementById("pairPerfBox");
+    pBox.innerHTML = byPair.length ? byPair.map(x => {
+      const r = x.hit_rate !== null ? x.hit_rate.toFixed(1) + "%" : "—";
+      const cls = (x.hit_rate || 0) >= 55 ? "badge-up" : ((x.hit_rate || 0) > 0 && x.hit_rate < 48 ? "badge-down" : "");
+      return `<div class="pill"><b>${x.pair}</b>: <span class="${cls}">${r}</span> (${x.hits}/${x.settled})</div>`;
+    }).join("") : '<span class="muted">لم تُحسم توقعات بعد...</span>';
 
     const fc = s.forecast;
     const banner = document.getElementById("fcBanner");
@@ -236,46 +230,46 @@
     const durEl = document.getElementById("fcDuration");
 
     if (fc && fc.ok) {
-      document.getElementById("fcUpdated").textContent = `آخر تحديث للتوقع: ${fc.updated_at} | السعر المرجعي: ${fc.ref_price}`;
-      banner.className = "banner " + (fc.direction === "صعود" ? "up" : "down");
+      document.getElementById("fcUpdated").textContent = `آخر تحديث: ${fc.updated_at} | السعر المرجعي: ${fc.ref_price}`;
+      const cls = fc.direction === "صعود" ? "up" : (fc.direction === "هبوط" ? "down" : "neutral");
+      banner.className = "banner " + cls;
       banner.textContent =
         `الاتجاه العام: ${fc.direction}  |  صعود ${(fc.prob_up * 100).toFixed(0)}% — هبوط ${(fc.prob_down * 100).toFixed(0)}%  |  ثقة ${(fc.dir_confidence * 100).toFixed(0)}%  |  ${fc.status}`;
 
-      tbody.innerHTML = (fc.table_rows || []).map(r => `
-        <tr>
-          <td>${fc.pair}</td>
-          <td>بعد ${r.horizon} دقيقة</td>
-          <td class="${r.ml_dir === 'صعود' ? 'badge-up' : (r.ml_dir === 'هبوط' ? 'badge-down' : '')}">${r.ml_dir}</td>
-          <td>${r.ml_pct}</td>
-          <td class="${r.lstm_dir === 'صعود' ? 'badge-up' : (r.lstm_dir === 'هبوط' ? 'badge-down' : '')}">${r.lstm_dir}</td>
-          <td>${r.lstm_pct}</td>
-        </tr>
-      `).join("");
+      tbody.innerHTML = (fc.table_rows || []).map(r => {
+        const hs = byH[String(r.horizon)];
+        const hTxt = hs && hs.settled ? `${hs.hit_rate.toFixed(0)}% (${hs.hits}/${hs.settled})` : "—";
+        return `
+          <tr>
+            <td>${fc.pair}</td>
+            <td>بعد ${r.horizon}د</td>
+            <td class="${r.ml_dir === 'صعود' ? 'badge-up' : (r.ml_dir === 'هبوط' ? 'badge-down' : '')}">${r.ml_dir}</td>
+            <td>${r.ml_pct}</td>
+            <td class="${r.lstm_dir === 'صعود' ? 'badge-up' : (r.lstm_dir === 'هبوط' ? 'badge-down' : '')}">${r.lstm_dir}</td>
+            <td>${r.lstm_pct}</td>
+            <td><b>${r.blend_dir} (${r.blend_pct})</b></td>
+            <td>${hTxt}</td>
+          </tr>`;
+      }).join("");
 
       const d = fc.duration || {};
-      if (d.duration_est !== null && d.duration_est !== undefined) {
-        durEl.textContent = `مدة استمرار الاتجاه (${fc.direction}): ${d.duration_est} دقيقة | النطاق: ${d.duration_lo}–${d.duration_hi} دقيقة | ثقة المدة: ${(d.confidence * 100).toFixed(0)}% | ${d.note || ""}`;
-      } else {
-        durEl.textContent = d.note || "لا تقدير مدة بعد";
-      }
+      durEl.textContent = (d.duration_est !== null && d.duration_est !== undefined)
+        ? `مدة الاتجاه (${fc.direction}): ${d.duration_est} دقيقة | النطاق: ${d.duration_lo}–${d.duration_hi} دقيقة | ثقة المدة: ${(d.confidence * 100).toFixed(0)}%`
+        : (d.note || "");
 
-      // تنبيه صوتي في المتصفح عند وصول توقع جديد يتجاوز الحد
       const alertKey = `${fc.pair}_${fc.ref_ts}`;
-      const thr = Number(document.getElementById("soundThreshold").value || 70) / 100;
-      if (document.getElementById("soundEnabled").checked && fc.dir_confidence >= thr && alertKey !== lastAlertKey) {
+      const thr = Number(document.getElementById("soundThreshold").value || 65) / 100;
+      if (document.getElementById("soundEnabled").checked && fc.direction !== "محايد" && fc.dir_confidence >= thr && alertKey !== lastAlertKey) {
         lastAlertKey = alertKey;
         playBeep(fc.direction === "صعود" ? 880 : 580, 0.4);
       }
     } else {
       banner.className = "banner";
-      banner.textContent = (fc && fc.note) ? fc.note : (s.note || "في انتظار البيانات...");
-      tbody.innerHTML = "";
-      durEl.textContent = "";
+      banner.textContent = (fc && fc.note) ? fc.note : "في انتظار البيانات...";
+      tbody.innerHTML = ""; durEl.textContent = "";
     }
 
-    if (Array.isArray(s.candles_tail) && s.candles_tail.length > 2) {
-      drawChart(s.candles_tail);
-    }
+    if (Array.isArray(s.candles_tail) && s.candles_tail.length > 2) drawChart(s.candles_tail);
     if (Array.isArray(s.logs)) {
       const box = document.getElementById("logsBox");
       box.textContent = s.logs.join("\n");
@@ -284,31 +278,21 @@
   }
 
   function drawChart(candles) {
-    const canvas = document.getElementById("priceChart");
-    const ctx = canvas.getContext("2d");
+    const canvas = document.getElementById("priceChart"), ctx = canvas.getContext("2d");
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
-
     const closes = candles.map(c => c.close);
-    const min = Math.min(...closes), max = Math.max(...closes);
-    const span = (max - min) || 1e-6;
-
-    ctx.strokeStyle = "#3b82f6";
-    ctx.lineWidth = 2;
-    ctx.beginPath();
+    const min = Math.min(...closes), max = Math.max(...closes), span = (max - min) || 1e-6;
+    ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 2; ctx.beginPath();
     closes.forEach((v, i) => {
       const x = 15 + (i / (closes.length - 1)) * (w - 30);
       const y = h - 15 - ((v - min) / span) * (h - 30);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
-
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "12px monospace";
-    ctx.fillText(max.toFixed(5), 10, 14);
-    ctx.fillText(min.toFixed(5), 10, h - 4);
+    ctx.fillStyle = "#94a3b8"; ctx.font = "12px monospace";
+    ctx.fillText(max.toFixed(5), 10, 14); ctx.fillText(min.toFixed(5), 10, h - 4);
   }
-
   loadConfig();
 </script>
 </body>
