@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IQ AI Analyzer v5 — العقل الموحّد (CatBoost + LightGBM + XGBoost)</title>
+  <title>IQ AI Analyzer v6 — توقع 3 شمعات مستقبلية</title>
   <style>
     :root {
       --bg: #0b1220; --card: #121c2e; --border: #1f2e47;
@@ -12,7 +12,7 @@
     }
     * { box-sizing: border-box; font-family: "Segoe UI", Tahoma, sans-serif; }
     body { margin: 0; background: var(--bg); color: var(--text); padding: 14px; }
-    .container { max-width: 1160px; margin: 0 auto; display: grid; gap: 12px; }
+    .container { max-width: 1200px; margin: 0 auto; display: grid; gap: 12px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
     h1 { margin: 0 0 8px; font-size: 1.18rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -24,39 +24,39 @@
     button.secondary { background: #1e293b; border-color: #334155; }
     button.otc { background: #7c3aed; border-color: #7c3aed; }
     button.danger { background: #991b1b; border-color: #b91c1c; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(165px, 1fr)); gap: 10px; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
     .stat { background: #0d1524; border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
     .stat .label { color: var(--muted); font-size: 0.78rem; }
     .stat .val { font-size: 1.05rem; font-weight: 700; margin-top: 4px; }
-    .banner {
-      padding: 14px; border-radius: 10px; font-size: 1.02rem; font-weight: 700;
-      background: #0d1524; border-right: 5px solid var(--accent);
+    .tf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
+    .tf-card { background: #0d1524; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
+    .tf-title { font-weight: 700; font-size: 1rem; margin-bottom: 8px; color: #93c5fd; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    .candle-row {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 8px; margin-bottom: 6px; border-radius: 8px; background: #121c2e; border-right: 4px solid #475569;
     }
-    .banner.up { border-right-color: var(--up); color: #6ee7b7; }
-    .banner.down { border-right-color: var(--down); color: #fca5a5; }
-    .banner.neutral { border-right-color: var(--warn); color: #fcd34d; }
-    table { width: 100%; border-collapse: collapse; margin-top: 6px; }
-    th, td { padding: 9px; text-align: center; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
-    th { color: var(--muted); font-size: 0.82rem; }
+    .candle-row.up { border-right-color: var(--up); }
+    .candle-row.down { border-right-color: var(--down); }
+    .candle-row.neutral { border-right-color: var(--warn); }
     .badge-up { color: var(--up); font-weight: 700; }
     .badge-down { color: var(--down); font-weight: 700; }
     .badge-neutral { color: var(--warn); font-weight: 700; }
     .pair-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
     .pill { background: #0d1524; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 0.84rem; }
-    canvas { width: 100%; height: 170px; background: #09101c; border-radius: 8px; display: block; }
+    canvas { width: 100%; height: 190px; background: #09101c; border-radius: 8px; display: block; }
     .logs {
       background: #070c15; border: 1px solid var(--border); border-radius: 8px;
-      padding: 10px; height: 185px; overflow-y: auto; font-family: monospace;
-      font-size: 0.81rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap;
+      padding: 10px; height: 175px; overflow-y: auto; font-family: monospace;
+      font-size: 0.8rem; line-height: 1.5; color: #cbd5e1; white-space: pre-wrap;
     }
-    .muted { color: var(--muted); font-size: 0.8rem; }
+    .muted { color: var(--muted); font-size: 0.78rem; }
   </style>
 </head>
 <body>
 <div class="container">
   <div class="card">
     <h1>
-      <span>⚡ IQ AI Analyzer v5 — العقل الموحّد (CatBoost + LightGBM + XGBoost)</span>
+      <span>🕯️ IQ AI Analyzer v6 — توقع 3 شمعات مستقبلية متتالية (أنماط + هندسي + GBDT + Deep Learning)</span>
       <span id="connBadge" class="muted">غير متصل</span>
     </h1>
     <div class="row">
@@ -71,54 +71,45 @@
       <div class="row">
         <label>الزوج:</label>
         <select id="pairSelect">
-          <optgroup label="السوق العادي (أيام العمل)">
+          <optgroup label="السوق العادي">
             <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
             <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
             <option>NZDUSD</option><option>EURJPY</option><option>EURGBP</option><option>GBPJPY</option>
           </optgroup>
-          <optgroup label="نظام OTC (العطلات ونهاية الأسبوع)">
+          <optgroup label="عطلات OTC">
             <option>EURUSD-OTC</option><option>GBPUSD-OTC</option><option>USDJPY-OTC</option>
             <option>USDCHF-OTC</option><option>USDCAD-OTC</option><option>AUDUSD-OTC</option>
             <option>NZDUSD-OTC</option><option>EURJPY-OTC</option><option>EURGBP-OTC</option><option>GBPJPY-OTC</option>
           </optgroup>
         </select>
-        <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق الزوج</button>
-        <button class="otc" onclick="toggleOtcPair()">🔄 تبديل لـ OTC / عادي</button>
-        <button onclick="sendCommand({train_now: true})">تدريب وتصحيح الآن</button>
+        <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق</button>
+        <button class="otc" onclick="toggleOtcPair()">🔄 OTC / عادي</button>
+        <button onclick="sendCommand({train_now: true})">تدريب الـ 12 نموذج الآن</button>
         <button class="danger" onclick="sendCommand({stop: true})">إيقاف</button>
       </div>
       <div class="row">
-        <label><input id="soundEnabled" type="checkbox" checked /> تنبيه صوتي</label>
-        <label>ثقة %:</label>
-        <input id="soundThreshold" type="number" value="62" min="50" max="99" style="width:65px;" />
-        <button class="secondary" onclick="unlockAndTestBeep()">🔊 الصوت</button>
+        <label><input id="soundEnabled" type="checkbox" checked /> تنبيه</label>
+        <input id="soundThreshold" type="number" value="62" min="50" max="99" style="width:62px;" />%
+        <button class="secondary" onclick="unlockAndTestBeep()">🔊</button>
       </div>
     </div>
   </div>
 
   <div class="stats-grid">
-    <div class="stat"><div class="label">حالة المحرك</div><div id="stStatus" class="val">—</div></div>
+    <div class="stat"><div class="label">الحالة</div><div id="stStatus" class="val">—</div></div>
     <div class="stat"><div class="label">الزوج النشط</div><div id="stPair" class="val">—</div></div>
-    <div class="stat"><div class="label">عدد الشموع</div><div id="stCandles" class="val">0</div></div>
+    <div class="stat"><div class="label">الشموع</div><div id="stCandles" class="val">0</div></div>
     <div class="stat"><div class="label">آخر شمعة</div><div id="stLastCandle" class="val">—</div></div>
-    <div class="stat"><div class="label">نسبة نجاح العملة</div><div id="stPerf" class="val">—</div></div>
-    <div class="stat"><div class="label">تعلّم ذاتي</div><div id="stSelfLearn" class="val">—</div></div>
+    <div class="stat"><div class="label">دقة العملة</div><div id="stPerf" class="val">—</div></div>
+    <div class="stat"><div class="label">أخطاء مصححة</div><div id="stMistakes" class="val">0</div></div>
   </div>
 
   <div class="card">
-    <div id="fcUpdated" class="muted" style="margin-bottom:6px;">آخر تحديث: —</div>
-    <div id="fcBanner" class="banner">في انتظار البيانات من Google Colab...</div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>الزوج</th><th>الأفق</th><th>القرار الموحد</th><th>الثقة</th>
-          <th>توافق الخبراء</th><th>تفاصيل النماذج (احتمال الصعود)</th><th>دقة الأفق الفعلية</th>
-        </tr>
-      </thead>
-      <tbody id="fcTableBody"></tbody>
-    </table>
-    <div id="fcDuration" style="margin-top:10px; font-weight:600; color:#93c5fd;"></div>
+    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+      <span id="fcUpdated" class="muted">آخر تحديث: —</span>
+      <span class="muted">كل فريم يعرض 3 شمعات مستقبلية متتالية + دقتها الفعلية</span>
+    </div>
+    <div id="tfGrid" class="tf-grid"><div class="muted">في انتظار التوقعات من Colab...</div></div>
   </div>
 
   <div class="card">
@@ -127,18 +118,26 @@
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">حركة السعر (آخر 60 شمعة إغلاق)</div>
-    <canvas id="priceChart" width="1000" height="170"></canvas>
+    <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+      <span class="muted">السعر الحقيقي + إسقاط 3 شمعات مستقبلية متوقعة</span>
+      <select id="chartTf" onchange="if(lastState) renderState(lastState)">
+        <option value="5">فريم 5 دقائق</option>
+        <option value="10">فريم 10 دقائق</option>
+        <option value="15" selected>فريم 15 دقيقة</option>
+        <option value="30">فريم 30 دقيقة</option>
+      </select>
+    </div>
+    <canvas id="priceChart" width="1000" height="190"></canvas>
   </div>
 
   <div class="card">
-    <div class="muted" style="margin-bottom:6px;">سجل المحرك والتعلم من الأخطاء</div>
-    <div id="logsBox" class="logs">لا توجد سجلات بعد...</div>
+    <div class="muted" style="margin-bottom:6px;">سجل المحرك</div>
+    <div id="logsBox" class="logs">لا توجد سجلات...</div>
   </div>
 </div>
 
 <script>
-  let audioCtx = null, lastAlertKey = "", timer = null;
+  let audioCtx = null, lastAlertKey = "", timer = null, lastState = null;
   const apiUrlEl = document.getElementById("apiUrl");
   const apiTokenEl = document.getElementById("apiToken");
   const pairSelect = document.getElementById("pairSelect");
@@ -186,6 +185,7 @@
       const data = await res.json();
       if (data.error) { document.getElementById("connBadge").textContent = "خطأ: " + data.error; return; }
       document.getElementById("connBadge").textContent = "متصل (" + new Date().toLocaleTimeString() + ")";
+      lastState = data;
       renderState(data);
     } catch { document.getElementById("connBadge").textContent = "فشل الاتصال"; }
   }
@@ -209,49 +209,44 @@
     const st = s.stats || {};
     const rate = st.hit_rate !== null && st.hit_rate !== undefined ? st.hit_rate.toFixed(1) + "%" : "—";
     document.getElementById("stPerf").textContent = st.settled ? `${st.hits}/${st.settled} (${rate})` : `معلق ${st.pending || 0}`;
-    document.getElementById("stSelfLearn").textContent = `أخطاء متعلم منها: ${st.mistakes || 0}`;
+    document.getElementById("stMistakes").textContent = st.mistakes || 0;
 
-    const byH = st.by_horizon || {};
+    const byTfStep = st.by_tf_step || {};
     const byPair = st.by_pair || [];
-    const pBox = document.getElementById("pairPerfBox");
-    pBox.innerHTML = byPair.length ? byPair.map(x => {
+    document.getElementById("pairPerfBox").innerHTML = byPair.length ? byPair.map(x => {
       const r = x.hit_rate !== null ? x.hit_rate.toFixed(1) + "%" : "—";
       const cls = (x.hit_rate || 0) >= 55 ? "badge-up" : ((x.hit_rate || 0) > 0 && x.hit_rate < 48 ? "badge-down" : "");
       return `<div class="pill"><b>${x.pair}</b>: <span class="${cls}">${r}</span> (${x.hits}/${x.settled})</div>`;
     }).join("") : '<span class="muted">لم تُحسم توقعات بعد...</span>';
 
     const fc = s.forecast;
-    const banner = document.getElementById("fcBanner");
-    const tbody = document.getElementById("fcTableBody");
-    const durEl = document.getElementById("fcDuration");
-
-    if (fc && fc.ok) {
+    const grid = document.getElementById("tfGrid");
+    if (fc && fc.ok && fc.tf_cards) {
       document.getElementById("fcUpdated").textContent = `آخر تحديث: ${fc.updated_at} | السعر المرجعي: ${fc.ref_price}`;
-      const cls = fc.direction === "صعود" ? "up" : (fc.direction === "هبوط" ? "down" : "neutral");
-      banner.className = "banner " + cls;
-      banner.textContent =
-        `القرار الموحد: ${fc.direction}  |  صعود ${(fc.prob_up * 100).toFixed(0)}% — هبوط ${(fc.prob_down * 100).toFixed(0)}%  |  ثقة ${(fc.dir_confidence * 100).toFixed(0)}%  |  ${fc.status}`;
-
-      tbody.innerHTML = (fc.table_rows || []).map(r => {
-        const hs = byH[String(r.horizon)];
-        const hTxt = hs && hs.settled ? `${hs.hit_rate.toFixed(0)}% (${hs.hits}/${hs.settled})` : "—";
-        const dCls = r.direction === "صعود" ? "badge-up" : (r.direction === "هبوط" ? "badge-down" : "badge-neutral");
-        return `
-          <tr>
-            <td>${fc.pair}</td>
-            <td>بعد ${r.horizon}د</td>
-            <td class="${dCls}">${r.direction}</td>
-            <td><b>${r.pct}</b></td>
-            <td>${r.agree}</td>
-            <td class="muted">${r.experts}</td>
-            <td>${hTxt}</td>
-          </tr>`;
+      grid.innerHTML = ["5", "10", "15", "30"].map(tf => {
+        const list = fc.tf_cards[tf] || [];
+        const rowsHtml = list.map(c => {
+          const cls = c.direction === "صعود" ? "up" : (c.direction === "هبوط" ? "down" : "neutral");
+          const bCls = c.direction === "صعود" ? "badge-up" : (c.direction === "هبوط" ? "badge-down" : "badge-neutral");
+          const arrow = c.direction === "صعود" ? "▲" : (c.direction === "هبوط" ? "▼" : "◆");
+          const accObj = byTfStep[`${tf}_${c.step}`];
+          const accTxt = accObj && accObj.settled ? `${accObj.hit_rate.toFixed(0)}% (${accObj.hits}/${accObj.settled})` : "—";
+          const gbTxt = c.gbdt_prob !== null && c.gbdt_prob !== undefined ? (c.gbdt_prob * 100).toFixed(0) + "%" : "—";
+          const dlTxt = c.dl_prob !== null && c.dl_prob !== undefined ? (c.dl_prob * 100).toFixed(0) + "%" : "—";
+          return `
+            <div class="candle-row ${cls}">
+              <div>
+                <div><b>الشمعة ${c.step}</b> <span class="muted">(+${c.offset_min}د)</span></div>
+                <div class="muted">أنماط ${(c.pat_prob*100).toFixed(0)}% | إحصاء ${(c.stat_prob*100).toFixed(0)}% | ذكاء ${gbTxt} | عميق ${dlTxt}</div>
+              </div>
+              <div style="text-align:left;">
+                <div class="${bCls}">${arrow} ${c.direction} ${(c.conf*100).toFixed(0)}%</div>
+                <div class="muted">دقة: ${accTxt}</div>
+              </div>
+            </div>`;
+        }).join("");
+        return `<div class="tf-card"><div class="tf-title">⏱️ فريم ${tf} دقائق (3 شمعات قادمة)</div>${rowsHtml}</div>`;
       }).join("");
-
-      const d = fc.duration || {};
-      durEl.textContent = (d.duration_est !== null && d.duration_est !== undefined)
-        ? `مدة الاتجاه (${fc.direction}): ${d.duration_est} دقيقة | النطاق: ${d.duration_lo}–${d.duration_hi} دقيقة | ثقة المدة: ${(d.confidence * 100).toFixed(0)}%`
-        : (d.note || "");
 
       const alertKey = `${fc.pair}_${fc.ref_ts}`;
       const thr = Number(document.getElementById("soundThreshold").value || 62) / 100;
@@ -260,12 +255,14 @@
         playBeep(fc.direction === "صعود" ? 880 : 580, 0.4);
       }
     } else {
-      banner.className = "banner";
-      banner.textContent = (fc && fc.note) ? fc.note : "في انتظار البيانات...";
-      tbody.innerHTML = ""; durEl.textContent = "";
+      grid.innerHTML = `<div class="muted">${(fc && fc.note) ? fc.note : "في انتظار التوقعات..."}</div>`;
     }
 
-    if (Array.isArray(s.candles_tail) && s.candles_tail.length > 2) drawChart(s.candles_tail);
+    if (Array.isArray(s.candles_tail) && s.candles_tail.length > 2) {
+      const selTf = document.getElementById("chartTf").value;
+      const proj = (fc && fc.ok && fc.tf_cards) ? (fc.tf_cards[selTf] || []) : [];
+      drawChart(s.candles_tail, proj);
+    }
     if (Array.isArray(s.logs)) {
       const box = document.getElementById("logsBox");
       box.textContent = s.logs.join("\n");
@@ -273,19 +270,38 @@
     }
   }
 
-  function drawChart(candles) {
+  function drawChart(candles, projCandles) {
     const canvas = document.getElementById("priceChart"), ctx = canvas.getContext("2d");
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
+
     const closes = candles.map(c => c.close);
     const min = Math.min(...closes), max = Math.max(...closes), span = (max - min) || 1e-6;
+    const totalPts = closes.length + (projCandles.length * 4);
+
     ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 2; ctx.beginPath();
     closes.forEach((v, i) => {
-      const x = 15 + (i / (closes.length - 1)) * (w - 30);
-      const y = h - 15 - ((v - min) / span) * (h - 30);
+      const x = 15 + (i / (totalPts - 1)) * (w - 30);
+      const y = h - 18 - ((v - min) / span) * (h - 36);
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     });
     ctx.stroke();
+
+    // رسم إسقاط 3 شمعات مستقبلية على يمين الشارت
+    let curY = h - 18 - ((closes[closes.length - 1] - min) / span) * (h - 36);
+    projCandles.forEach((p, idx) => {
+      const x = 15 + ((closes.length + idx * 4 + 1) / (totalPts - 1)) * (w - 30);
+      const bw = 22;
+      const deltaPx = p.direction === "صعود" ? -24 : (p.direction === "هبوط" ? 24 : 0);
+      const nextY = Math.max(20, Math.min(h - 20, curY + deltaPx));
+      ctx.fillStyle = p.direction === "صعود" ? "rgba(16,185,129,0.75)" : (p.direction === "هبوط" ? "rgba(239,68,68,0.75)" : "rgba(245,158,11,0.75)");
+      const topY = Math.min(curY, nextY), boxH = Math.max(8, Math.abs(nextY - curY));
+      ctx.fillRect(x, topY, bw, boxH);
+      ctx.fillStyle = "#e2e8f0"; ctx.font = "11px sans-serif";
+      ctx.fillText(`ش${p.step}`, x + 4, topY - 4);
+      curY = nextY;
+    });
+
     ctx.fillStyle = "#94a3b8"; ctx.font = "12px monospace";
     ctx.fillText(max.toFixed(5), 10, 14); ctx.fillText(min.toFixed(5), 10, h - 4);
   }
