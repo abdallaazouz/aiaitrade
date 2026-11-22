@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>IQ AI Analyzer v6 — توقع 3 شمعات مستقبلية</title>
+  <title>IQ AI Analyzer v6 — التحليل + التليجرام</title>
   <style>
     :root {
       --bg: #0b1220; --card: #121c2e; --border: #1f2e47;
@@ -14,7 +14,7 @@
     body { margin: 0; background: var(--bg); color: var(--text); padding: 14px; }
     .container { max-width: 1200px; margin: 0 auto; display: grid; gap: 12px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; }
-    h1 { margin: 0 0 8px; font-size: 1.18rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+    h1 { margin: 0 0 8px; font-size: 1.15rem; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
     .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     input, select, button {
       background: #0d1524; color: var(--text); border: 1px solid var(--border);
@@ -23,11 +23,16 @@
     button { cursor: pointer; background: var(--accent); border-color: var(--accent); font-weight: 600; }
     button.secondary { background: #1e293b; border-color: #334155; }
     button.otc { background: #7c3aed; border-color: #7c3aed; }
+    button.tg { background: #0284c7; border-color: #0284c7; }
     button.danger { background: #991b1b; border-color: #b91c1c; }
-    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+    .tabs { display: flex; gap: 8px; }
+    .tab-btn { background: #1e293b; border-color: #334155; }
+    .tab-btn.active { background: var(--accent); border-color: var(--accent); }
+    .hidden { display: none !important; }
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); gap: 10px; }
     .stat { background: #0d1524; border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
     .stat .label { color: var(--muted); font-size: 0.78rem; }
-    .stat .val { font-size: 1.05rem; font-weight: 700; margin-top: 4px; }
+    .stat .val { font-size: 1.02rem; font-weight: 700; margin-top: 4px; }
     .tf-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 12px; }
     .tf-card { background: #0d1524; border: 1px solid var(--border); border-radius: 12px; padding: 12px; }
     .tf-title { font-weight: 700; font-size: 1rem; margin-bottom: 8px; color: #93c5fd; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
@@ -41,9 +46,15 @@
     .badge-up { color: var(--up); font-weight: 700; }
     .badge-down { color: var(--down); font-weight: 700; }
     .badge-neutral { color: var(--warn); font-weight: 700; }
+    .tg-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }
+    .tg-check {
+      display: flex; align-items: center; gap: 8px; background: #0d1524;
+      border: 1px solid var(--border); border-radius: 8px; padding: 10px; cursor: pointer;
+    }
+    .tg-check input { width: 18px; height: 18px; accent-color: #0284c7; }
     .pair-pills { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 6px; }
     .pill { background: #0d1524; border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-size: 0.84rem; }
-    canvas { width: 100%; height: 190px; background: #09101c; border-radius: 8px; display: block; }
+    canvas { width: 100%; height: 185px; background: #09101c; border-radius: 8px; display: block; }
     .logs {
       background: #070c15; border: 1px solid var(--border); border-radius: 8px;
       padding: 10px; height: 175px; overflow-y: auto; font-family: monospace;
@@ -56,91 +67,155 @@
 <div class="container">
   <div class="card">
     <h1>
-      <span>🕯️ IQ AI Analyzer v6 — توقع 3 شمعات مستقبلية متتالية (أنماط + هندسي + GBDT + Deep Learning)</span>
+      <span>🕯️ IQ AI Analyzer v6 — الشمعات الـ 3 + تليجرام</span>
       <span id="connBadge" class="muted">غير متصل</span>
     </h1>
-    <div class="row">
-      <input id="apiUrl" type="text" placeholder="رابط Google Apps Script (/exec)" style="flex:2; min-width:240px;" />
-      <input id="apiToken" type="password" placeholder="Secret Token" style="flex:1; min-width:140px;" />
-      <button onclick="saveConfig()">حفظ والاتصال</button>
+    <div class="row" style="justify-content:space-between;">
+      <div class="row" style="flex:1;">
+        <input id="apiUrl" type="text" placeholder="رابط Google Apps Script (/exec)" style="flex:2; min-width:220px;" />
+        <input id="apiToken" type="password" placeholder="Secret Token" style="flex:1; min-width:130px;" />
+        <button onclick="saveConfig()">حفظ والاتصال</button>
+      </div>
+      <div class="tabs">
+        <button id="btnTabMain" class="tab-btn active" onclick="showTab('main')">📊 لوحة التوقعات</button>
+        <button id="btnTabTg" class="tab-btn" onclick="showTab('tg')">📲 إعدادات التليجرام</button>
+      </div>
     </div>
   </div>
 
-  <div class="card">
-    <div class="row" style="justify-content: space-between;">
-      <div class="row">
-        <label>الزوج:</label>
-        <select id="pairSelect">
-          <optgroup label="السوق العادي">
-            <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
-            <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
-            <option>NZDUSD</option><option>EURJPY</option><option>EURGBP</option><option>GBPJPY</option>
-          </optgroup>
-          <optgroup label="عطلات OTC">
-            <option>EURUSD-OTC</option><option>GBPUSD-OTC</option><option>USDJPY-OTC</option>
-            <option>USDCHF-OTC</option><option>USDCAD-OTC</option><option>AUDUSD-OTC</option>
-            <option>NZDUSD-OTC</option><option>EURJPY-OTC</option><option>EURGBP-OTC</option><option>GBPJPY-OTC</option>
-          </optgroup>
+  <!-- صفحة التليجرام البسيطة -->
+  <div id="tabTg" class="card hidden">
+    <h2 style="margin-top:0;">📲 إعدادات إشعارات التليجرام</h2>
+    <p class="muted">
+      علّم على أي عدد من الشمعات الـ 12 بالأسفل؛ لن يُرسل إشعار التليجرام إلا إذا اتفقت <b>كل الشمعات المعلمة</b> على نفس الاتجاه وتجاوزت كلها نسبة الثقة المطلوبة، ولن يتكرر الإشعار قبل انتهاء المدة المتوقعة للحركة السابقة.
+    </p>
+    <div class="row" style="background:#0d1524; padding:12px; border-radius:10px; border:1px solid var(--border);">
+      <label class="row" style="cursor:pointer;">
+        <input id="tgEnabled" type="checkbox" style="width:18px;height:18px;" />
+        <b>تفعيل إشعارات التليجرام</b>
+      </label>
+      <label style="margin-right:16px;">نسبة الثقة المطلوبة (%):</label>
+      <input id="tgMinConf" type="number" value="62" min="50" max="99" style="width:80px;" />
+      <button class="tg" onclick="saveTgConfig()">💾 حفظ إعدادات التليجرام</button>
+      <button class="secondary" onclick="sendCommand({test_telegram: true})">🔔 اختبار الاتصال بالتليجرام</button>
+    </div>
+
+    <div id="tgStatusBox" class="stat" style="margin-top:10px;">
+      <div class="label">حالة التليجرام الأخيرة</div>
+      <div id="tgInfoText" class="val">—</div>
+    </div>
+
+    <div class="tg-grid" id="tgCandlesGrid"></div>
+  </div>
+
+  <!-- الصفحة الرئيسية -->
+  <div id="tabMain" style="display:grid; gap:12px;">
+    <div class="card">
+      <div class="row" style="justify-content: space-between;">
+        <div class="row">
+          <label>الزوج:</label>
+          <select id="pairSelect">
+            <optgroup label="السوق العادي">
+              <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
+              <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
+              <option>NZDUSD</option><option>EURJPY</option><option>EURGBP</option><option>GBPJPY</option>
+            </optgroup>
+            <optgroup label="عطلات OTC">
+              <option>EURUSD-OTC</option><option>GBPUSD-OTC</option><option>USDJPY-OTC</option>
+              <option>USDCHF-OTC</option><option>USDCAD-OTC</option><option>AUDUSD-OTC</option>
+              <option>NZDUSD-OTC</option><option>EURJPY-OTC</option><option>EURGBP-OTC</option><option>GBPJPY-OTC</option>
+            </optgroup>
+          </select>
+          <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق</button>
+          <button class="otc" onclick="toggleOtcPair()">🔄 OTC / عادي</button>
+          <button onclick="sendCommand({train_now: true})">تدريب الـ 12 نموذج الآن</button>
+          <button class="danger" onclick="sendCommand({stop: true})">إيقاف</button>
+        </div>
+        <div class="row">
+          <label><input id="soundEnabled" type="checkbox" checked /> صوت المتصفح</label>
+          <input id="soundThreshold" type="number" value="62" min="50" max="99" style="width:60px;" />%
+          <button class="secondary" onclick="unlockAndTestBeep()">🔊</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="stats-grid">
+      <div class="stat"><div class="label">الحالة</div><div id="stStatus" class="val">—</div></div>
+      <div class="stat"><div class="label">الزوج النشط</div><div id="stPair" class="val">—</div></div>
+      <div class="stat"><div class="label">الشموع</div><div id="stCandles" class="val">0</div></div>
+      <div class="stat"><div class="label">آخر شمعة</div><div id="stLastCandle" class="val">—</div></div>
+      <div class="stat"><div class="label">دقة العملة</div><div id="stPerf" class="val">—</div></div>
+      <div class="stat"><div class="label">التليجرام</div><div id="stTgMini" class="val">—</div></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+        <span id="fcUpdated" class="muted">آخر تحديث: —</span>
+        <span class="muted">3 شمعات مستقبلية متتالية لكل فريم</span>
+      </div>
+      <div id="tfGrid" class="tf-grid"><div class="muted">في انتظار التوقعات من Colab...</div></div>
+    </div>
+
+    <div class="card">
+      <div class="muted">نسبة النجاح الفعلية لكل عملة:</div>
+      <div id="pairPerfBox" class="pair-pills"><span class="muted">لم تُحسم توقعات بعد...</span></div>
+    </div>
+
+    <div class="card">
+      <div class="row" style="justify-content:space-between; margin-bottom:6px;">
+        <span class="muted">السعر الحقيقي + إسقاط 3 شمعات مستقبلية</span>
+        <select id="chartTf" onchange="if(lastState) renderState(lastState)">
+          <option value="5">فريم 5 دقائق</option>
+          <option value="10">فريم 10 دقائق</option>
+          <option value="15" selected>فريم 15 دقيقة</option>
+          <option value="30">فريم 30 دقيقة</option>
         </select>
-        <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق</button>
-        <button class="otc" onclick="toggleOtcPair()">🔄 OTC / عادي</button>
-        <button onclick="sendCommand({train_now: true})">تدريب الـ 12 نموذج الآن</button>
-        <button class="danger" onclick="sendCommand({stop: true})">إيقاف</button>
       </div>
-      <div class="row">
-        <label><input id="soundEnabled" type="checkbox" checked /> تنبيه</label>
-        <input id="soundThreshold" type="number" value="62" min="50" max="99" style="width:62px;" />%
-        <button class="secondary" onclick="unlockAndTestBeep()">🔊</button>
-      </div>
+      <canvas id="priceChart" width="1000" height="185"></canvas>
     </div>
-  </div>
 
-  <div class="stats-grid">
-    <div class="stat"><div class="label">الحالة</div><div id="stStatus" class="val">—</div></div>
-    <div class="stat"><div class="label">الزوج النشط</div><div id="stPair" class="val">—</div></div>
-    <div class="stat"><div class="label">الشموع</div><div id="stCandles" class="val">0</div></div>
-    <div class="stat"><div class="label">آخر شمعة</div><div id="stLastCandle" class="val">—</div></div>
-    <div class="stat"><div class="label">دقة العملة</div><div id="stPerf" class="val">—</div></div>
-    <div class="stat"><div class="label">أخطاء مصححة</div><div id="stMistakes" class="val">0</div></div>
-  </div>
-
-  <div class="card">
-    <div class="row" style="justify-content:space-between; margin-bottom:10px;">
-      <span id="fcUpdated" class="muted">آخر تحديث: —</span>
-      <span class="muted">كل فريم يعرض 3 شمعات مستقبلية متتالية + دقتها الفعلية</span>
+    <div class="card">
+      <div class="muted" style="margin-bottom:6px;">سجل المحرك</div>
+      <div id="logsBox" class="logs">لا توجد سجلات...</div>
     </div>
-    <div id="tfGrid" class="tf-grid"><div class="muted">في انتظار التوقعات من Colab...</div></div>
-  </div>
-
-  <div class="card">
-    <div class="muted">نسبة النجاح الفعلية لكل عملة:</div>
-    <div id="pairPerfBox" class="pair-pills"><span class="muted">لم تُحسم توقعات بعد...</span></div>
-  </div>
-
-  <div class="card">
-    <div class="row" style="justify-content:space-between; margin-bottom:6px;">
-      <span class="muted">السعر الحقيقي + إسقاط 3 شمعات مستقبلية متوقعة</span>
-      <select id="chartTf" onchange="if(lastState) renderState(lastState)">
-        <option value="5">فريم 5 دقائق</option>
-        <option value="10">فريم 10 دقائق</option>
-        <option value="15" selected>فريم 15 دقيقة</option>
-        <option value="30">فريم 30 دقيقة</option>
-      </select>
-    </div>
-    <canvas id="priceChart" width="1000" height="190"></canvas>
-  </div>
-
-  <div class="card">
-    <div class="muted" style="margin-bottom:6px;">سجل المحرك</div>
-    <div id="logsBox" class="logs">لا توجد سجلات...</div>
   </div>
 </div>
 
 <script>
-  let audioCtx = null, lastAlertKey = "", timer = null, lastState = null;
+  const CANDLE_DEFS = [
+    { key: "5_1",  label: "فريم 5 دقائق — الشمعة 1 (+5د)" },
+    { key: "5_2",  label: "فريم 5 دقائق — الشمعة 2 (+10د)" },
+    { key: "5_3",  label: "فريم 5 دقائق — الشمعة 3 (+15د)" },
+    { key: "10_1", label: "فريم 10 دقائق — الشمعة 1 (+10د)" },
+    { key: "10_2", label: "فريم 10 دقائق — الشمعة 2 (+20د)" },
+    { key: "10_3", label: "فريم 10 دقائق — الشمعة 3 (+30د)" },
+    { key: "15_1", label: "فريم 15 دقيقة — الشمعة 1 (+15د)" },
+    { key: "15_2", label: "فريم 15 دقيقة — الشمعة 2 (+30د)" },
+    { key: "15_3", label: "فريم 15 دقيقة — الشمعة 3 (+45د)" },
+    { key: "30_1", label: "فريم 30 دقيقة — الشمعة 1 (+30د)" },
+    { key: "30_2", label: "فريم 30 دقيقة — الشمعة 2 (+60د)" },
+    { key: "30_3", label: "فريم 30 دقيقة — الشمعة 3 (+90د)" }
+  ];
+
+  let audioCtx = null, lastAlertKey = "", timer = null, lastState = null, tgLoaded = false;
   const apiUrlEl = document.getElementById("apiUrl");
   const apiTokenEl = document.getElementById("apiToken");
   const pairSelect = document.getElementById("pairSelect");
+
+  // بناء مربعات الـ 12 شمعة
+  document.getElementById("tgCandlesGrid").innerHTML = CANDLE_DEFS.map(c => `
+    <label class="tg-check">
+      <input type="checkbox" class="tg-candle-cb" value="${c.key}" />
+      <span>${c.label}</span>
+    </label>
+  `).join("");
+
+  function showTab(name) {
+    document.getElementById("tabMain").classList.toggle("hidden", name !== "main");
+    document.getElementById("tabTg").classList.toggle("hidden", name !== "tg");
+    document.getElementById("btnTabMain").classList.toggle("active", name === "main");
+    document.getElementById("btnTabTg").classList.toggle("active", name === "tg");
+  }
 
   function loadConfig() {
     apiUrlEl.value = localStorage.getItem("iq_api_url") || "";
@@ -150,6 +225,7 @@
   function saveConfig() {
     localStorage.setItem("iq_api_url", apiUrlEl.value.trim());
     localStorage.setItem("iq_api_token", apiTokenEl.value.trim());
+    tgLoaded = false;
     startPolling();
   }
   function toggleOtcPair() {
@@ -197,10 +273,38 @@
       body: JSON.stringify({ action: "command", token, ...cmd })
     });
     const d = await res.json();
-    if (d.ok) alert("تم إرسال الأمر للمحرك.");
+    if (d.ok) alert(cmd.test_telegram ? "تم إرسال طلب اختبار التليجرام — راقب الجروب والحالة خلال ثوانٍ." : "تم إرسال الأمر للمحرك.");
+  }
+  async function saveTgConfig() {
+    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
+    if (!url || !token) return alert("أدخل الرابط والـ Token أولًا.");
+    const candles = [...document.querySelectorAll(".tg-candle-cb:checked")].map(el => el.value);
+    const tg_config = {
+      enabled: document.getElementById("tgEnabled").checked,
+      min_conf: Number(document.getElementById("tgMinConf").value || 62),
+      candles
+    };
+    const res = await fetch(url, {
+      method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
+      body: JSON.stringify({ action: "save_tg_config", token, tg_config })
+    });
+    const d = await res.json();
+    if (d.ok) alert(`تم حفظ إعدادات التليجرام (${candles.length} شمعة محددة).`);
   }
 
   function renderState(s) {
+    if (!tgLoaded && s.tg_config) {
+      tgLoaded = true;
+      document.getElementById("tgEnabled").checked = Boolean(s.tg_config.enabled);
+      document.getElementById("tgMinConf").value = s.tg_config.min_conf || 62;
+      const set = new Set(s.tg_config.candles || []);
+      document.querySelectorAll(".tg-candle-cb").forEach(cb => cb.checked = set.has(cb.value));
+    }
+
+    const tgs = s.tg_status || {};
+    document.getElementById("tgInfoText").textContent = `${tgs.info || "—"} ${tgs.cooldown_sec > 0 ? `(متبقي للتهدئة: ${Math.ceil(tgs.cooldown_sec/60)}د)` : ""}`;
+    document.getElementById("stTgMini").textContent = (s.tg_config && s.tg_config.enabled) ? (tgs.cooldown_sec > 0 ? `تهدئة ${Math.ceil(tgs.cooldown_sec/60)}د` : "مفعل وجاهز") : "معطل";
+
     document.getElementById("stStatus").textContent = s.engine_status || "—";
     document.getElementById("stPair").textContent = s.pair || "—";
     document.getElementById("stCandles").textContent = (s.candle_count || 0).toLocaleString();
@@ -209,7 +313,6 @@
     const st = s.stats || {};
     const rate = st.hit_rate !== null && st.hit_rate !== undefined ? st.hit_rate.toFixed(1) + "%" : "—";
     document.getElementById("stPerf").textContent = st.settled ? `${st.hits}/${st.settled} (${rate})` : `معلق ${st.pending || 0}`;
-    document.getElementById("stMistakes").textContent = st.mistakes || 0;
 
     const byTfStep = st.by_tf_step || {};
     const byPair = st.by_pair || [];
@@ -231,13 +334,11 @@
           const arrow = c.direction === "صعود" ? "▲" : (c.direction === "هبوط" ? "▼" : "◆");
           const accObj = byTfStep[`${tf}_${c.step}`];
           const accTxt = accObj && accObj.settled ? `${accObj.hit_rate.toFixed(0)}% (${accObj.hits}/${accObj.settled})` : "—";
-          const gbTxt = c.gbdt_prob !== null && c.gbdt_prob !== undefined ? (c.gbdt_prob * 100).toFixed(0) + "%" : "—";
-          const dlTxt = c.dl_prob !== null && c.dl_prob !== undefined ? (c.dl_prob * 100).toFixed(0) + "%" : "—";
           return `
             <div class="candle-row ${cls}">
               <div>
                 <div><b>الشمعة ${c.step}</b> <span class="muted">(+${c.offset_min}د)</span></div>
-                <div class="muted">أنماط ${(c.pat_prob*100).toFixed(0)}% | إحصاء ${(c.stat_prob*100).toFixed(0)}% | ذكاء ${gbTxt} | عميق ${dlTxt}</div>
+                <div class="muted">أنماط ${(c.pat_prob*100).toFixed(0)}% | إحصاء ${(c.stat_prob*100).toFixed(0)}%</div>
               </div>
               <div style="text-align:left;">
                 <div class="${bCls}">${arrow} ${c.direction} ${(c.conf*100).toFixed(0)}%</div>
@@ -245,7 +346,7 @@
               </div>
             </div>`;
         }).join("");
-        return `<div class="tf-card"><div class="tf-title">⏱️ فريم ${tf} دقائق (3 شمعات قادمة)</div>${rowsHtml}</div>`;
+        return `<div class="tf-card"><div class="tf-title">⏱️ فريم ${tf} دقائق</div>${rowsHtml}</div>`;
       }).join("");
 
       const alertKey = `${fc.pair}_${fc.ref_ts}`;
@@ -274,11 +375,9 @@
     const canvas = document.getElementById("priceChart"), ctx = canvas.getContext("2d");
     const w = canvas.width, h = canvas.height;
     ctx.clearRect(0, 0, w, h);
-
     const closes = candles.map(c => c.close);
     const min = Math.min(...closes), max = Math.max(...closes), span = (max - min) || 1e-6;
     const totalPts = closes.length + (projCandles.length * 4);
-
     ctx.strokeStyle = "#3b82f6"; ctx.lineWidth = 2; ctx.beginPath();
     closes.forEach((v, i) => {
       const x = 15 + (i / (totalPts - 1)) * (w - 30);
@@ -287,12 +386,10 @@
     });
     ctx.stroke();
 
-    // رسم إسقاط 3 شمعات مستقبلية على يمين الشارت
     let curY = h - 18 - ((closes[closes.length - 1] - min) / span) * (h - 36);
     projCandles.forEach((p, idx) => {
       const x = 15 + ((closes.length + idx * 4 + 1) / (totalPts - 1)) * (w - 30);
-      const bw = 22;
-      const deltaPx = p.direction === "صعود" ? -24 : (p.direction === "هبوط" ? 24 : 0);
+      const bw = 22, deltaPx = p.direction === "صعود" ? -24 : (p.direction === "هبوط" ? 24 : 0);
       const nextY = Math.max(20, Math.min(h - 20, curY + deltaPx));
       ctx.fillStyle = p.direction === "صعود" ? "rgba(16,185,129,0.75)" : (p.direction === "هبوط" ? "rgba(239,68,68,0.75)" : "rgba(245,158,11,0.75)");
       const topY = Math.min(curY, nextY), boxH = Math.max(8, Math.abs(nextY - curY));
@@ -301,7 +398,6 @@
       ctx.fillText(`ش${p.step}`, x + 4, topY - 4);
       curY = nextY;
     });
-
     ctx.fillStyle = "#94a3b8"; ctx.font = "12px monospace";
     ctx.fillText(max.toFixed(5), 10, 14); ctx.fillText(min.toFixed(5), 10, h - 4);
   }
