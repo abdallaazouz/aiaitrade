@@ -339,11 +339,12 @@
     <div class="card">
       <div class="hero-banner" id="heroBanner">
         <div>
-          <div class="muted" id="fcUpdated">آخر تحديث: —</div>
+          <div class="muted" id="marketMeta">الاتجاه يجمع إشارات الفريمات من الشموع المكتملة فقط.</div>
           <div id="heroDirText" style="font-size:1.12rem; font-weight:800; margin-top:4px;">في انتظار التوقعات من المحرك السحابي...</div>
         </div>
         <div id="heroDurText" style="font-weight:700; color:#93c5fd; font-size:0.92rem;"></div>
       </div>
+      <div id="marketPatterns" class="muted" style="margin:0 2px 12px;"></div>
 
       <div id="tfGrid" class="tf-grid"></div>
     </div>
@@ -594,17 +595,29 @@
     if (fc && fc.ok && fc.tf_cards) {
       const cls = fc.direction === "صعود" ? "up" : (fc.direction === "هبوط" ? "down" : "neutral");
       hero.className = "hero-banner " + cls;
-      document.getElementById("fcUpdated").textContent = `آخر تحديث: ${fc.updated_at} • العملة: ${fc.pair}`;
+      const tfCount = Object.keys(fc.timeframe_summary || {}).length;
+      const candleCounts = Object.entries(fc.timeframe_summary || {})
+        .map(([tf, item]) => `${tf}د:${item.candles_used}`)
+        .join(" | ");
+      document.getElementById("marketMeta").textContent =
+        `تحليل الشموع المكتملة (حتى ${Number(fc.candles_per_timeframe || 1000).toLocaleString()} لكل فريم) • ${fc.pair} • ${candleCounts} • اتفاق الفريمات ${Math.round((fc.agreement || 0) * 100)}%`;
       document.getElementById("heroDirText").textContent =
-        `الاتجاه العام (15د): ${fc.direction} — ثقة ${Math.round(fc.dir_confidence * 100)}% (صعود ${Math.round(fc.prob_up * 100)}% / هبوط ${Math.round(fc.prob_down * 100)}%)`;
+        `اتجاه السوق عبر ${tfCount} فريم: ${fc.direction} — ثقة النماذج ${Math.round(fc.dir_confidence * 100)}% (صعود ${Math.round(fc.prob_up * 100)}% / هبوط ${Math.round(fc.prob_down * 100)}%)`;
+      document.getElementById("marketPatterns").textContent =
+        `أنماط الشموع المكتشفة: ${(fc.patterns || []).join("، ") || "لا يوجد نمط واضح"}`;
 
       const d = fc.duration || {};
       document.getElementById("heroDurText").textContent = (d.duration_est !== null && d.duration_est !== undefined)
-        ? `⏳ المدة المتوقعة للحركة: ${d.duration_est} دقيقة (${d.duration_lo}–${d.duration_hi}د)`
-        : "⏳ المدة قيد التجميع";
+        ? `⏳ مدة تاريخية تقديرية للحركة: ${d.duration_est} دقيقة (${d.duration_lo}–${d.duration_hi}د) • ثقة المدة ${Math.round((d.confidence || 0) * 100)}%`
+        : "⏳ لا تتوفر أنماط تاريخية كافية لتقدير المدة";
 
       grid.innerHTML = ["5", "10", "15", "30"].map(tf => {
         const list = fc.tf_cards[tf] || [];
+        const summary = (fc.timeframe_summary || {})[tf];
+        const tfDuration = summary && summary.duration;
+        const tfLabel = summary
+          ? `${summary.direction} ${Math.round(summary.confidence * 100)}%${tfDuration && tfDuration.duration_est !== null ? ` • مدة ${tfDuration.duration_est}د` : ""}`
+          : "بيانات مكتملة غير كافية";
         const boxes = list.map(c => {
           const bCls = c.direction === "صعود" ? "up" : (c.direction === "هبوط" ? "down" : "neutral");
           const arrow = c.direction === "صعود" ? "▲" : (c.direction === "هبوط" ? "▼" : "◆");
@@ -624,14 +637,15 @@
                 <span class="exp-chip">GBDT ${pctStr(c.gbdt_prob)}</span>
                 <span class="exp-chip">عميق ${pctStr(c.dl_prob)}</span>
                 <span class="exp-chip">Kronos ${pctStr(c.kronos_prob)}</span>
+                <span class="exp-chip">أنماط الشمعة: ${(c.patterns || []).join("، ") || "لا يوجد نمط واضح"}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
               </div>
             </div>`;
         }).join("");
         return `
           <div class="tf-card">
-            <div class="tf-head"><span>⏱️ فريم ${tf} دقائق</span><span class="muted">3 شمعات قادمة</span></div>
-            ${boxes}
+            <div class="tf-head"><span>⏱️ فريم ${tf} دقائق</span><span class="muted">${tfLabel}</span></div>
+            ${boxes || '<div class="muted">تُعرض الإشارات بعد توفر تسلسل كافٍ من الشموع المكتملة.</div>'}
           </div>`;
       }).join("");
 
@@ -643,8 +657,10 @@
       }
     } else {
       hero.className = "hero-banner";
+      document.getElementById("marketMeta").textContent = "الاتجاه يجمع إشارات الفريمات من الشموع المكتملة فقط.";
       document.getElementById("heroDirText").textContent = (fc && fc.note) ? fc.note : "في انتظار التوقعات...";
       document.getElementById("heroDurText").textContent = "";
+      document.getElementById("marketPatterns").textContent = "";
       grid.innerHTML = "";
     }
 
