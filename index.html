@@ -344,8 +344,6 @@
         </div>
         <div id="heroDurText" style="font-weight:700; color:#93c5fd; font-size:0.92rem;"></div>
       </div>
-      <div id="marketPatterns" class="muted" style="margin:0 2px 12px;"></div>
-
       <div id="tfGrid" class="tf-grid"></div>
     </div>
 
@@ -603,9 +601,6 @@
         `تحليل الشموع المكتملة (حتى ${Number(fc.candles_per_timeframe || 1000).toLocaleString()} لكل فريم) • ${fc.pair} • ${candleCounts} • اتفاق الفريمات ${Math.round((fc.agreement || 0) * 100)}%`;
       document.getElementById("heroDirText").textContent =
         `اتجاه السوق عبر ${tfCount} فريم: ${fc.direction} — ثقة النماذج ${Math.round(fc.dir_confidence * 100)}% (صعود ${Math.round(fc.prob_up * 100)}% / هبوط ${Math.round(fc.prob_down * 100)}%)`;
-      document.getElementById("marketPatterns").textContent =
-        `أنماط الشموع المكتشفة: ${(fc.patterns || []).join("، ") || "لا يوجد نمط واضح"}`;
-
       const d = fc.duration || {};
       document.getElementById("heroDurText").textContent = (d.duration_est !== null && d.duration_est !== undefined)
         ? `⏳ مدة تاريخية تقديرية للحركة: ${d.duration_est} دقيقة (${d.duration_lo}–${d.duration_hi}د) • ثقة المدة ${Math.round((d.confidence || 0) * 100)}%`
@@ -632,12 +627,10 @@
               </div>
               <div class="prog-track"><div class="prog-fill ${bCls}" style="width:${confPct}%"></div></div>
               <div class="experts-row">
-                <span class="exp-chip">أنماط ${pctStr(c.pat_prob)}</span>
                 <span class="exp-chip">إحصاء ${pctStr(c.stat_prob)}</span>
                 <span class="exp-chip">GBDT ${pctStr(c.gbdt_prob)}</span>
                 <span class="exp-chip">عميق ${pctStr(c.dl_prob)}</span>
                 <span class="exp-chip">Kronos ${pctStr(c.kronos_prob)}</span>
-                <span class="exp-chip">أنماط الشمعة: ${(c.patterns || []).join("، ") || "لا يوجد نمط واضح"}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
               </div>
             </div>`;
@@ -660,7 +653,6 @@
       document.getElementById("marketMeta").textContent = "الاتجاه يجمع إشارات الفريمات من الشموع المكتملة فقط.";
       document.getElementById("heroDirText").textContent = (fc && fc.note) ? fc.note : "في انتظار التوقعات...";
       document.getElementById("heroDurText").textContent = "";
-      document.getElementById("marketPatterns").textContent = "";
       grid.innerHTML = "";
     }
 
