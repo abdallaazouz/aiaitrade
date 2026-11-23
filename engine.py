@@ -52,6 +52,23 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
+
+def call_with_timeout(fn, timeout_sec=25):
+    box = {"res": None, "err": None}
+    def _run():
+        try:
+            box["res"] = fn()
+        except Exception as exc:
+            box["err"] = exc
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        raise TimeoutError(f"انتهت مهلة الانتظار ({timeout_sec} ثانية)")
+    if box["err"] is not None:
+        raise box["err"]
+    return box["res"]
+
 # ===========================================================================
 # 1. الإعدادات من GitHub Secrets
 # ===========================================================================
@@ -1063,75 +1080,84 @@ def poll_cloud_command():
 
 if __name__ == "__main__":
     start_ts = time.time()
-    init_kronos()
     threading.Thread(target=train_loop, daemon=True).start()
     c = db_connect()
     api = None
+
+    # إرسال فوري للويب منذ الثانية الأولى حتى ترى الحالة الحية
+    add_log("🚀 بدء تشغيل المحرك على GitHub Actions...")
+    push_to_cloud(read_candles(c, current_pair), current_pair, None, 0, "جاري تحميل Kronos والاتصال...")
+
+    # تحميل Kronos في الخلفية حتى لا يعطّل الاتصال
+    threading.Thread(target=init_kronos, daemon=True).start()
+
     try:
-        add_log("تشغيل المحرك على GitHub Actions...")
-        api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-        res = api.connect()
-        if not (res[0] if isinstance(res, tuple) else bool(res)) or not api.check_connect():
-            raise RuntimeError(f"فشل الاتصال: {res}")
-        add_log("اتصال ناجح بـ IQ Option.")
-
-        hist = api.get_candles(current_pair, INTERVAL, 1000, int(time.time()))
-        n, max_ts = save_candles(c, current_pair, hist)
-        if AUTO_OTC_ON_CLOSED_MARKET and not current_pair.endswith("-OTC"):
-            if max_ts is None or (int(time.time()) - max_ts > 600):
-                current_pair = current_pair + "-OTC"
-                add_log(f"تحويل تلقائي للعطلة إلى {current_pair}")
-                hist = api.get_candles(current_pair, INTERVAL, 1000, int(time.time()))
-                n, max_ts = save_candles(c, current_pair, hist)
-
-        raw = read_candles(c, current_pair)
-        add_log(f"شموع {current_pair}: جديدة={n} | الإجمالي={len(raw)}")
-        enqueue_training(raw, current_pair)
-
         while not stop_event.is_set():
             if time.time() - start_ts >= MAX_RUNTIME_SEC:
-                add_log("انتهاء مدة الجلسة المجدولة (سيتم حفظ البيانات واستئناف الدورة التالية).")
+                add_log("انتهاء مدة الجلسة المجدولة.")
                 break
 
             cmd = poll_cloud_command()
             if cmd:
                 if cmd.get("stop"):
+                    add_log("أمر إيقاف من الويب.")
                     break
                 if cmd.get("test_telegram"):
                     test_telegram_connection()
                 if cmd.get("pair") and cmd["pair"] != current_pair:
                     current_pair = cmd["pair"].strip().upper()
                     add_log(f"تغيير الزوج إلى: {current_pair}")
-                    hist = api.get_candles(current_pair, INTERVAL, 1000, int(time.time()))
-                    save_candles(c, current_pair, hist)
-                    raw = read_candles(c, current_pair)
-                    enqueue_training(raw, current_pair)
                 if cmd.get("train_now"):
-                    add_log("تدريب وتصحيح فوري...")
                     raw = read_candles(c, current_pair)
                     enqueue_training(raw, current_pair, force=True)
 
-            if api is None or not api.check_connect():
-                api = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-                api.connect()
+            try:
+                if api is None or not api.check_connect():
+                    add_log("جاري الاتصال بـ IQ Option...")
+                    push_to_cloud(read_candles(c, current_pair), current_pair, None, 0, "جاري الاتصال بـ IQ Option...")
+                    def _connect():
+                        a = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
+                        r = a.connect()
+                        ok = r[0] if isinstance(r, tuple) else bool(r)
+                        if not ok or not a.check_connect():
+                            raise RuntimeError(f"فشل دخول IQ Option: {r}")
+                        return a
+                    api = call_with_timeout(_connect, 25)
+                    add_log("✅ اتصال ناجح بـ IQ Option.")
 
-            candles = api.get_candles(current_pair, INTERVAL, 60, int(time.time()))
-            n, max_ts = save_candles(c, current_pair, candles)
-            raw = read_candles(c, current_pair)
-            gaps = detect_gaps(raw)
+                    hist = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 1000, int(time.time())), 25)
+                    n, max_ts = save_candles(c, current_pair, hist)
+                    if AUTO_OTC_ON_CLOSED_MARKET and not current_pair.endswith("-OTC"):
+                        if max_ts is None or (int(time.time()) - max_ts > 600):
+                            current_pair = current_pair + "-OTC"
+                            add_log(f"تحويل تلقائي للعطلة إلى {current_pair}")
+                            hist = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 1000, int(time.time())), 25)
+                            n, max_ts = save_candles(c, current_pair, hist)
+                    raw = read_candles(c, current_pair)
+                    enqueue_training(raw, current_pair)
 
-            settle_pending_predictions(raw, current_pair)
-            if len(raw) >= 150:
-                latest_forecast = build_forecast(raw, current_pair)
-                if latest_forecast.get("ok"):
-                    if n > 0:
-                        save_all_3candle_predictions(latest_forecast)
-                    maybe_send_telegram(latest_forecast, raw)
-            if n > 0:
-                add_log(f"شموع جديدة={n} | الإجمالي={len(raw)}")
-                enqueue_training(raw, current_pair)
+                candles = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 60, int(time.time())), 20)
+                n, max_ts = save_candles(c, current_pair, candles)
+                raw = read_candles(c, current_pair)
+                gaps = detect_gaps(raw)
 
-            push_to_cloud(raw, current_pair, max_ts, gaps, "يعمل 24/7 على GitHub Actions")
+                settle_pending_predictions(raw, current_pair)
+                if len(raw) >= 150:
+                    latest_forecast = build_forecast(raw, current_pair)
+                    if latest_forecast.get("ok"):
+                        if n > 0:
+                            save_all_3candle_predictions(latest_forecast)
+                        maybe_send_telegram(latest_forecast, raw)
+                if n > 0:
+                    add_log(f"شموع جديدة={n} | الإجمالي={len(raw)}")
+                    enqueue_training(raw, current_pair)
+
+                push_to_cloud(raw, current_pair, max_ts, gaps, "يعمل 24/7 على GitHub Actions")
+            except Exception as exc:
+                add_log(f"⚠️ مشكلة اتصال مؤقتة: {exc}")
+                api = None
+                push_to_cloud(read_candles(c, current_pair), current_pair, None, 0, f"إعادة محاولة: {exc}")
+
             stop_event.wait(15)
     finally:
         push_to_cloud(read_candles(c, current_pair), current_pair, None, 0, "بانتظار الدورة التالية")
