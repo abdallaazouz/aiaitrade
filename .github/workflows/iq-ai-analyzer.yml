@@ -57,6 +57,9 @@ jobs:
             echo "No previous backup found"
           fi
 
+      - name: Import legacy EURUSD candles
+        run: python import_legacy_candles.py
+
       - name: Run Analyzer Engine
         env:
           IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
