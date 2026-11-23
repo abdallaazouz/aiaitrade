@@ -12,7 +12,8 @@ catboost
 lightgbm
 xgboost
 torch
-huggingface_hub
-einops
-safetensors
+huggingface_hub==0.33.1
+einops==0.8.1
+safetensors==0.6.2
+tqdm
 git+https://github.com/iqoptionapi/iqoptionapi.git
