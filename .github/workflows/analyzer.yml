@@ -1,0 +1,73 @@
+name: IQ AI Analyzer 24/7
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 */5 * * *"  # يعمل تلقائيًا كل 5 ساعات
+
+concurrency:
+  group: iq-ai-analyzer-runner
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run-analyzer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330  # 5.5 ساعات بحد أقصى
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Clone Kronos Foundation Model
+        run: |
+          git clone --depth 1 https://github.com/shiyu-coder/Kronos.git kronos_repo || true
+
+      - name: Restore DB and Models from Release Backup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p data/models_v6
+          if gh release view state-backup >/dev/null 2>&1; then
+            gh release download state-backup -p "backup.tar.gz" -D . || true
+            if [ -f backup.tar.gz ]; then
+              tar -xzf backup.tar.gz -C data || true
+            fi
+          fi
+
+      - name: Run Analyzer Engine (4h 45m)
+        env:
+          IQ_EMAIL: ${{ secrets.IQ_EMAIL }}
+          IQ_PASSWORD: ${{ secrets.IQ_PASSWORD }}
+          APPS_SCRIPT_URL: ${{ secrets.APPS_SCRIPT_URL }}
+          SECRET_TOKEN: ${{ secrets.SECRET_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          MAX_RUNTIME_SEC: "17100"
+          ENABLE_KRONOS: "1"
+        run: |
+          python engine.py
+
+      - name: Save DB and Models to Release Backup
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tar -czf backup.tar.gz -C data .
+          if ! gh release view state-backup >/dev/null 2>&1; then
+            gh release create state-backup --title "Analyzer State Backup" --notes "Auto backup (DB & models)"
+          fi
+          gh release upload state-backup backup.tar.gz --clobber
