@@ -94,6 +94,8 @@
         <input id="tgEnabled" type="checkbox" style="width:18px;height:18px;" />
         <b>تفعيل إشعارات التليجرام</b>
       </label>
+      <label style="margin-right:12px;">فترة الانتظار بين الإشعارات (دقيقة — 0 تلقائي):</label>
+<input id="tgCooldownMin" type="number" value="60" min="0" max="1440" style="width:80px;" />
       <label style="margin-right:16px;">نسبة الثقة المطلوبة (%):</label>
       <input id="tgMinConf" type="number" value="62" min="50" max="99" style="width:80px;" />
       <button class="tg" onclick="saveTgConfig()">💾 حفظ إعدادات التليجرام</button>
@@ -182,6 +184,7 @@
 </div>
 
 <script>
+  const DEFAULT_APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwF8A2KbeEi_wqN9dJwRP47xrQdDtfxJahemWxaooCdWBiSXY8HVapjtQl-Rk84F36dtQ/exec";
   const CANDLE_DEFS = [
     { key: "5_1",  label: "فريم 5 دقائق — الشمعة 1 (+5د)" },
     { key: "5_2",  label: "فريم 5 دقائق — الشمعة 2 (+10د)" },
@@ -216,12 +219,14 @@
     document.getElementById("btnTabMain").classList.toggle("active", name === "main");
     document.getElementById("btnTabTg").classList.toggle("active", name === "tg");
   }
+function loadConfig() {
+  const hashToken = new URLSearchParams(location.hash.replace("#", "")).get("token");
+  apiUrlEl.value = localStorage.getItem("iq_api_url") || DEFAULT_APPS_SCRIPT_URL;
+  apiTokenEl.value = hashToken || localStorage.getItem("iq_api_token") || "";
+  if (hashToken) localStorage.setItem("iq_api_token", hashToken);
+  if (apiUrlEl.value && apiTokenEl.value) startPolling();
+}
 
-  function loadConfig() {
-    apiUrlEl.value = localStorage.getItem("iq_api_url") || "";
-    apiTokenEl.value = localStorage.getItem("iq_api_token") || "";
-    if (apiUrlEl.value && apiTokenEl.value) startPolling();
-  }
   function saveConfig() {
     localStorage.setItem("iq_api_url", apiUrlEl.value.trim());
     localStorage.setItem("iq_api_token", apiTokenEl.value.trim());
@@ -279,11 +284,16 @@
     const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
     if (!url || !token) return alert("أدخل الرابط والـ Token أولًا.");
     const candles = [...document.querySelectorAll(".tg-candle-cb:checked")].map(el => el.value);
-    const tg_config = {
-      enabled: document.getElementById("tgEnabled").checked,
-      min_conf: Number(document.getElementById("tgMinConf").value || 62),
-      candles
-    };
+    // داخل saveTgConfig():
+const tg_config = {
+  enabled: document.getElementById("tgEnabled").checked,
+  min_conf: Number(document.getElementById("tgMinConf").value || 62),
+  cooldown_min: Number(document.getElementById("tgCooldownMin").value || 0),
+  candles
+};
+
+// داخل renderState() عند تحميل tg_config لأول مرة:
+document.getElementById("tgCooldownMin").value = s.tg_config.cooldown_min ?? 60;
     const res = await fetch(url, {
       method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" },
       body: JSON.stringify({ action: "save_tg_config", token, tg_config })
@@ -334,11 +344,15 @@
           const arrow = c.direction === "صعود" ? "▲" : (c.direction === "هبوط" ? "▼" : "◆");
           const accObj = byTfStep[`${tf}_${c.step}`];
           const accTxt = accObj && accObj.settled ? `${accObj.hit_rate.toFixed(0)}% (${accObj.hits}/${accObj.settled})` : "—";
+            const krTxt = c.kronos_prob !== null && c.kronos_prob !== undefined ? (c.kronos_prob * 100).toFixed(0) + "%" : "—";
           return `
             <div class="candle-row ${cls}">
               <div>
                 <div><b>الشمعة ${c.step}</b> <span class="muted">(+${c.offset_min}د)</span></div>
                 <div class="muted">أنماط ${(c.pat_prob*100).toFixed(0)}% | إحصاء ${(c.stat_prob*100).toFixed(0)}%</div>
+              
+// في السطر الفرعي:
+`<div class="muted">أنماط ${(c.pat_prob*100).toFixed(0)}% | إحصاء ${(c.stat_prob*100).toFixed(0)}% | Kronos ${krTxt}</div>`
               </div>
               <div style="text-align:left;">
                 <div class="${bCls}">${arrow} ${c.direction} ${(c.conf*100).toFixed(0)}%</div>
