@@ -212,7 +212,7 @@
         <div class="brand-icon">🧠</div>
         <div>
           <h1>IQ AI Analyzer Pro</h1>
-          <div class="sub">Kronos + الأنماط المتكررة + الإحصاء الهندسي + GBDT + Deep Learning</div>
+          <div class="sub">Kronos + الإحصاء الهندسي + GBDT + التعلم العميق</div>
         </div>
       </div>
 
@@ -594,17 +594,15 @@
       const cls = fc.direction === "صعود" ? "up" : (fc.direction === "هبوط" ? "down" : "neutral");
       hero.className = "hero-banner " + cls;
       const tfCount = Object.keys(fc.timeframe_summary || {}).length;
-      const candleCounts = Object.entries(fc.timeframe_summary || {})
-        .map(([tf, item]) => `${tf}د:${item.candles_used}`)
-        .join(" | ");
+      const trainingCandles = Number(fc.training_candles || 0).toLocaleString();
       document.getElementById("marketMeta").textContent =
-        `تحليل الشموع المكتملة (حتى ${Number(fc.candles_per_timeframe || 1000).toLocaleString()} لكل فريم) • ${fc.pair} • ${candleCounts} • اتفاق الفريمات ${Math.round((fc.agreement || 0) * 100)}%`;
+        `${fc.pair} • 12 هدفًا للتوقع • كل نموذج يستخدم حتى ${trainingCandles} شمعة تدريب`;
       document.getElementById("heroDirText").textContent =
-        `اتجاه السوق عبر ${tfCount} فريم: ${fc.direction} — ثقة النماذج ${Math.round(fc.dir_confidence * 100)}% (صعود ${Math.round(fc.prob_up * 100)}% / هبوط ${Math.round(fc.prob_down * 100)}%)`;
+        `اتجاه السوق: ${fc.direction} — الثقة ${Math.round(fc.dir_confidence * 100)}%`;
       const d = fc.duration || {};
       document.getElementById("heroDurText").textContent = (d.duration_est !== null && d.duration_est !== undefined)
         ? `⏳ مدة تاريخية تقديرية للحركة: ${d.duration_est} دقيقة (${d.duration_lo}–${d.duration_hi}د) • ثقة المدة ${Math.round((d.confidence || 0) * 100)}%`
-        : "⏳ لا تتوفر أنماط تاريخية كافية لتقدير المدة";
+        : "⏳ لا تتوفر مدة مؤكدة بعد";
 
       grid.innerHTML = ["5", "10", "15", "30"].map(tf => {
         const list = fc.tf_cards[tf] || [];
@@ -627,10 +625,8 @@
               </div>
               <div class="prog-track"><div class="prog-fill ${bCls}" style="width:${confPct}%"></div></div>
               <div class="experts-row">
-                <span class="exp-chip">إحصاء ${pctStr(c.stat_prob)}</span>
-                <span class="exp-chip">GBDT ${pctStr(c.gbdt_prob)}</span>
-                <span class="exp-chip">عميق ${pctStr(c.dl_prob)}</span>
-                <span class="exp-chip">Kronos ${pctStr(c.kronos_prob)}</span>
+                <span class="exp-chip">GBDT ${c.gbdt_prob === null || c.gbdt_prob === undefined ? "غير مدرب" : pctStr(c.gbdt_prob)}</span>
+                <span class="exp-chip">عميق ${c.dl_prob === null || c.dl_prob === undefined ? "غير مدرب" : pctStr(c.dl_prob)}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
               </div>
             </div>`;
@@ -650,7 +646,7 @@
       }
     } else {
       hero.className = "hero-banner";
-      document.getElementById("marketMeta").textContent = "الاتجاه يجمع إشارات الفريمات من الشموع المكتملة فقط.";
+      document.getElementById("marketMeta").textContent = "بانتظار اكتمال بيانات الشموع.";
       document.getElementById("heroDirText").textContent = (fc && fc.note) ? fc.note : "في انتظار التوقعات...";
       document.getElementById("heroDurText").textContent = "";
       grid.innerHTML = "";
