@@ -434,11 +434,15 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d["bearish_engulfing"] = (prev_bull & bear & (op >= close.shift(1)) & (close <= op.shift(1))).astype(int)
 
    
-hour = d["time"].dt.hour
-weekday = d["time"].dt.day_of_week
+   
+   hour = d["time"].dt.hour
+   weekday = d["time"].dt.day_of_week
 
-    d["hour_sin"], d["hour_cos"] = np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)
-    d["weekday_sin"], d["weekday_cos"] = np.sin(2 * np.pi * weekday / 7), np.cos(2 * np.pi * weekday / 7)
+   d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+   d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+   d["weekday_sin"] = np.sin(2 * np.pi * weekday / 7)
+  d["weekday_cos"] = np.cos(2 * np.pi * weekday / 7)
+
 
     ret1 = close.pct_change(1)
     vol20 = ret1.rolling(20).std()
