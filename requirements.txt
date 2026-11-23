@@ -1,0 +1,15 @@
+numpy
+pandas
+scipy
+scikit-learn
+statsmodels
+joblib
+requests
+catboost
+lightgbm
+xgboost
+torch
+huggingface_hub
+einops
+safetensors
+git+https://github.com/iqoptionapi/iqoptionapi.git
