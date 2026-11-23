@@ -625,8 +625,8 @@
               </div>
               <div class="prog-track"><div class="prog-fill ${bCls}" style="width:${confPct}%"></div></div>
               <div class="experts-row">
-                <span class="exp-chip">GBDT ${c.gbdt_prob === null || c.gbdt_prob === undefined ? "غير مدرب" : pctStr(c.gbdt_prob)}</span>
-                <span class="exp-chip">عميق ${c.dl_prob === null || c.dl_prob === undefined ? "غير مدرب" : pctStr(c.dl_prob)}</span>
+                <span class="exp-chip" title="${c.gbdt_status || "غير مدرب"}">GBDT ${c.gbdt_prob === null || c.gbdt_prob === undefined ? (c.gbdt_status || "غير مدرب") : pctStr(c.gbdt_prob)}</span>
+                <span class="exp-chip" title="${c.dl_status || "غير مدرب"}">عميق ${c.dl_prob === null || c.dl_prob === undefined ? (c.dl_status || "غير مدرب") : pctStr(c.dl_prob)}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
               </div>
             </div>`;
