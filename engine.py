@@ -145,6 +145,12 @@ if TORCH_AVAILABLE:
 
 stop_event = threading.Event()
 train_queue = queue.Queue()
+
+# متابعة مهام التدريب ومنع إضافتها أكثر من مرة
+training_jobs = set()
+training_lock = threading.Lock()
+active_training = None
+
 gbdt_models, dl_models = {}, {}
 last_train_count, last_mistake_retrain, last_retrain_ts = {}, {}, {}
 
@@ -427,7 +433,10 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d["bullish_engulfing"] = (prev_bear & bull & (op <= close.shift(1)) & (close >= op.shift(1))).astype(int)
     d["bearish_engulfing"] = (prev_bull & bear & (op >= close.shift(1)) & (close <= op.shift(1))).astype(int)
 
-    hour, weekday = d["time"].dt.hour, d["time"].dt.dayofweek
+   
+hour = d["time"].dt.hour
+weekday = d["time"].dt.day_of_week
+
     d["hour_sin"], d["hour_cos"] = np.sin(2 * np.pi * hour / 24), np.cos(2 * np.pi * hour / 24)
     d["weekday_sin"], d["weekday_cos"] = np.sin(2 * np.pi * weekday / 7), np.cos(2 * np.pi * weekday / 7)
 
@@ -617,18 +626,47 @@ def train_tf_step(raw, pair, tf, step):
         return cands
 
     scored = []
-    for name, clf in make_cands(y_tr).items():
-        try:
-            clf.fit(X_tr, y_tr, sample_weight=w_tr)
-            p_all = clf.predict_proba(X_te)
-            classes = list(clf.classes_)
-            if 1 not in classes:
-                continue
-            bal = balanced_accuracy_score(y_te, clf.predict(X_te))
-            brier = brier_score_loss(y_te, p_all[:, classes.index(1)])
-            scored.append((bal - 0.35 * brier, name, bal, brier))
-        except Exception:
+
+for name, clf in make_cands(y_tr).items():
+    try:
+        add_log(
+            f"🔬 اختبار الخوارزمية: {name} | "
+            f"{tf}د ش{step}"
+        )
+
+        clf.fit(X_tr, y_tr, sample_weight=w_tr)
+
+        p_all = clf.predict_proba(X_te)
+        classes = list(clf.classes_)
+
+        if 1 not in classes:
+            add_log(f"⚠️ {name}: فئة الصعود غير موجودة")
             continue
+
+        bal = balanced_accuracy_score(
+            y_te, clf.predict(X_te)
+        )
+
+        brier = brier_score_loss(
+            y_te, p_all[:, classes.index(1)]
+        )
+
+        scored.append(
+            (bal - 0.35 * brier, name, bal, brier)
+        )
+
+        add_log(
+            f"📊 {name}: Balanced Accuracy={bal:.4f} "
+            f"| Brier={brier:.4f}"
+        )
+
+    except Exception as exc:
+        add_log(
+            f"❌ فشل {name}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        continue
+
     if not scored:
         return "فشل GBDT."
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -1007,7 +1045,52 @@ def prediction_stats(pair):
         "pending": int(pending or 0), "by_tf_step": by_tf_step, "by_pair": by_pair,
     }
 
+
 def train_loop():
+    global latest_forecast, active_training
+
+    while not stop_event.is_set():
+        try:
+            job = train_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+
+        if job is None:
+            train_queue.task_done()
+            break
+
+        raw, pair, tf, step = job
+        k = (pair, tf, step)
+
+        active_training = k
+
+        try:
+            add_log(
+                f"🧠 بدء التدريب: {pair} | "
+                f"{tf} دقيقة | الشمعة {step} | "
+                f"البيانات={len(raw)}"
+            )
+
+            info = train_tf_step(raw, pair, tf, step)
+
+            add_log(f"✅ نتيجة التدريب: {info}")
+
+            if pair == current_pair and len(raw) >= 150:
+                latest_forecast = build_forecast(raw, pair)
+
+        except Exception as exc:
+            add_log(
+                f"❌ خطأ تدريب ({tf}د ش{step}): "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        finally:
+            with training_lock:
+                training_jobs.discard(k)
+
+            active_training = None
+            train_queue.task_done()
+
     global latest_forecast
     while not stop_event.is_set():
         try:
@@ -1027,15 +1110,42 @@ def train_loop():
         finally:
             train_queue.task_done()
 
+
 def enqueue_training(raw, pair, force=False):
     if len(raw) < 480:
+        add_log(f"انتظار البيانات: {len(raw)}/480 شمعة")
         return
+
+    added = 0
+
     for tf in TIMEFRAMES:
         for step in STEPS:
             k = (pair, tf, step)
-            if force or _load_gbdt(pair, tf, step) is None or len(raw) - last_train_count.get(k, 0) >= 240:
-                train_queue.put((raw.copy(), pair, tf, step))
-                last_train_count[k] = len(raw)
+
+            with training_lock:
+                if k in training_jobs:
+                    continue
+
+                model_missing = _load_gbdt(pair, tf, step) is None
+                previous_count = last_train_count.get(k, 0)
+                new_data = len(raw) - previous_count >= 240
+
+                if not (force or model_missing or new_data):
+                    continue
+
+                training_jobs.add(k)
+
+            train_queue.put((raw.copy(), pair, tf, step))
+            added += 1
+
+    if added:
+        add_log(
+            f"📚 أُضيفت {added} مهمة تدريب | "
+            f"المهام المنتظرة={train_queue.qsize()}"
+        )
+    else:
+        add_log("لا توجد مهام تدريب جديدة مطلوبة")
+
 
 def push_to_cloud(raw, pair, max_ts, gaps, status_text):
     with state_lock:
