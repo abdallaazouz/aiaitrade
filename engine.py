@@ -85,14 +85,17 @@ DEFAULT_PAIR = os.environ.get("DEFAULT_PAIR", "EURUSD")
 AUTO_OTC_ON_CLOSED_MARKET = True
 
 DATA_DIR = Path("data")
-MODEL_VERSION = "v7-gh-kronos"
-MODEL_DIR = DATA_DIR / "models_v6"
+MODEL_VERSION = "v8-mtf-sequence"
+MODEL_DIR = DATA_DIR / "models_v8"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_DB = DATA_DIR / "iq_ai_data.sqlite3"
 
 INTERVAL = 60
-MAX_CANDLES_IN_MEMORY = 20000
+MAX_CANDLES_IN_MEMORY = 40000
+MAX_TIMEFRAME_CANDLES = 1000
+SEQUENCE_LENGTH = 64
+MIN_TIMEFRAME_BARS_FOR_TRAINING = 750
 RETRAIN_NEW_CANDLES = 600
 MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
@@ -100,8 +103,9 @@ STEPS = (1, 2, 3)
 
 FEATURES = [
     "ret1", "ret2", "ret3", "ret5", "ret10", "ret20",
-    "sma5", "sma10", "sma20", "sma50", "sma100",
-    "ema5", "ema10", "ema20", "ema50",
+    "sma5", "sma10", "sma20", "sma50", "sma100", "sma200",
+    "ema5", "ema10", "ema20", "ema50", "ema100",
+    "sma_cross_50_200", "ema_cross_20_100",
     "gma5", "gma10", "gma20", "gma50", "gma_cross_5_20", "gma_cross_10_50",
     "geo_ret5", "geo_ret15", "log_slope20", "log_r2_20", "log_slope50", "ou_zscore",
     "rsi7", "rsi14", "macd", "macd_signal", "macd_hist",
@@ -117,10 +121,13 @@ FEATURES = [
 ]
 
 class FusionGBDTBrain:
-    def __init__(self, gbdt_members):
+    def __init__(self, gbdt_members, usable=True):
         self.gbdt_members = gbdt_members
+        self.usable = usable
 
     def predict_gbdt(self, X):
+        if not self.usable:
+            return None
         tot_w, acc = 0.0, 0.0
         for _, w, est in self.gbdt_members:
             p_all = est.predict_proba(X)
@@ -131,20 +138,18 @@ class FusionGBDTBrain:
         return (acc / tot_w) if tot_w > 0 else 0.5
 
 if TORCH_AVAILABLE:
-    class DeepCandleResNet(nn.Module):
+    class DeepCandleSequenceNet(nn.Module):
         def __init__(self, n_features):
             super().__init__()
-            self.in_proj = nn.Sequential(nn.Linear(n_features, 64), nn.BatchNorm1d(64), nn.SiLU())
-            self.block = nn.Sequential(
-                nn.Linear(64, 64), nn.BatchNorm1d(64), nn.SiLU(), nn.Dropout(0.20),
-                nn.Linear(64, 64), nn.BatchNorm1d(64)
+            self.sequence = nn.GRU(n_features, 64, batch_first=True)
+            self.head = nn.Sequential(
+                nn.LayerNorm(64), nn.Linear(64, 24), nn.SiLU(),
+                nn.Dropout(0.15), nn.Linear(24, 1)
             )
-            self.head = nn.Sequential(nn.SiLU(), nn.Linear(64, 24), nn.SiLU(), nn.Linear(24, 1))
 
         def forward(self, x):
-            h = self.in_proj(x)
-            h = h + self.block(h)
-            return self.head(h).squeeze(1)
+            _, hidden = self.sequence(x)
+            return self.head(hidden[-1]).squeeze(1)
 
 stop_event = threading.Event()
 train_queue = queue.Queue()
@@ -215,7 +220,7 @@ def kronos_predict_all(raw: pd.DataFrame, pair: str):
     if (pair, last_ts) in kronos_cache:
         return kronos_cache[(pair, last_ts)]
     try:
-        sub = raw.tail(360).copy().reset_index(drop=True)
+        sub = raw.tail(512).copy().reset_index(drop=True)
         x_df = sub[["open", "high", "low", "close", "volume"]].astype(float)
         x_ts = pd.to_datetime(sub["ts"], unit="s")
         y_ts = pd.Series(pd.date_range(start=x_ts.iloc[-1] + pd.Timedelta(minutes=1), periods=90, freq="1min"))
@@ -273,7 +278,8 @@ def db_connect():
                             prob_up REAL, prob_down REAL,
                             pat_prob REAL, stat_prob REAL, gbdt_prob REAL, dl_prob REAL, kronos_prob REAL,
                             duration_est INTEGER, duration_lo INTEGER, duration_hi INTEGER,
-                            duration_confidence REAL, model_name TEXT, model_version TEXT,
+                            duration_confidence REAL, feature_ts INTEGER,
+                            model_name TEXT, model_version TEXT,
                             status TEXT NOT NULL DEFAULT 'PENDING',
                             actual_price REAL, actual_up INTEGER, hit INTEGER,
                             settled_at TEXT, data_note TEXT
@@ -285,6 +291,7 @@ def db_connect():
                         ("start_ts", "INTEGER"), ("end_ts", "INTEGER"), ("start_price", "REAL"),
                         ("pat_prob", "REAL"), ("stat_prob", "REAL"), ("gbdt_prob", "REAL"),
                         ("dl_prob", "REAL"), ("kronos_prob", "REAL"),
+                        ("feature_ts", "INTEGER"),
                     ]:
                         if col_name not in cols:
                             c.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
@@ -296,13 +303,18 @@ def db_connect():
                             step_idx = 1
                         WHERE start_ts IS NULL
                     """)
+                    c.execute(
+                        "UPDATE predictions SET status='OBSOLETE' WHERE status='PENDING' AND COALESCE(model_version, '') != ?",
+                        (MODEL_VERSION,)
+                    )
+                    c.execute("DROP INDEX IF EXISTS idx_pred_tf_step")
                     c.execute("""
                         DELETE FROM predictions
-                        WHERE id NOT IN (SELECT MAX(id) FROM predictions GROUP BY pair, created_ts, timeframe, step_idx)
+                        WHERE id NOT IN (SELECT MAX(id) FROM predictions GROUP BY pair, created_ts, timeframe, step_idx, model_version)
                     """)
                     c.execute("""
                         CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_tf_step
-                        ON predictions(pair, created_ts, timeframe, step_idx)
+                        ON predictions(pair, created_ts, timeframe, step_idx, model_version)
                     """)
                     c.execute("""
                         CREATE INDEX IF NOT EXISTS idx_predictions_pair_status
@@ -354,6 +366,56 @@ def read_candles(c, pair):
         df["time"] = pd.to_datetime(df["ts"], unit="s", utc=True)
     return df
 
+def completed_minute_candles(raw: pd.DataFrame, as_of_ts=None) -> pd.DataFrame:
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume", "time"])
+    now_ts = int(time.time()) if as_of_ts is None else int(as_of_ts)
+    d = raw.copy()
+    d["ts"] = pd.to_numeric(d["ts"], errors="coerce")
+    d = d.dropna(subset=["ts", "open", "high", "low", "close"])
+    d["ts"] = d["ts"].astype("int64")
+    d = d[(d["ts"] % INTERVAL == 0) & (d["ts"] + INTERVAL <= now_ts)]
+    d = d.drop_duplicates("ts", keep="last").sort_values("ts").reset_index(drop=True)
+    if "volume" not in d:
+        d["volume"] = 0.0
+    d["time"] = pd.to_datetime(d["ts"], unit="s", utc=True)
+    return d
+
+def closed_timeframe_bars(raw: pd.DataFrame, tf: int, limit=MAX_TIMEFRAME_CANDLES, as_of_ts=None):
+    minutes = int(tf)
+    if minutes < 1:
+        raise ValueError("الفريم يجب أن يكون دقيقة واحدة على الأقل")
+    now_ts = int(time.time()) if as_of_ts is None else int(as_of_ts)
+    minute_bars = completed_minute_candles(raw, as_of_ts=now_ts)
+    if minute_bars.empty:
+        return minute_bars
+
+    width = minutes * INTERVAL
+    d = minute_bars.copy()
+    d["bucket_ts"] = (d["ts"] // width) * width
+    bars = d.groupby("bucket_ts", sort=True).agg(
+        open=("open", "first"),
+        high=("high", "max"),
+        low=("low", "min"),
+        close=("close", "last"),
+        volume=("volume", "sum"),
+        count=("ts", "size"),
+        first_ts=("ts", "min"),
+        last_ts=("ts", "max"),
+    )
+    expected_last = bars.index + (minutes - 1) * INTERVAL
+    bars = bars[
+        (bars["count"] == minutes)
+        & (bars["first_ts"].to_numpy() == bars.index.to_numpy())
+        & (bars["last_ts"].to_numpy() == expected_last.to_numpy())
+        & (bars.index.to_numpy() + width <= now_ts)
+    ].tail(int(limit))
+    bars = bars.drop(columns=["count", "first_ts", "last_ts"])
+    bars.index.name = "ts"
+    bars = bars.reset_index()
+    bars["time"] = pd.to_datetime(bars["ts"], unit="s", utc=True)
+    return bars.reset_index(drop=True)
+
 def detect_gaps(df):
     return 0 if (df is None or len(df) < 2) else int((df["ts"].diff().dropna() > INTERVAL * 1.5).sum())
 
@@ -381,10 +443,12 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
 
     for n in (1, 2, 3, 5, 10, 20):
         d[f"ret{n}"] = close.pct_change(n)
-    for n in (5, 10, 20, 50, 100):
+    for n in (5, 10, 20, 50, 100, 200):
         d[f"sma{n}"] = close / close.rolling(n).mean() - 1
-    for n in (5, 10, 20, 50):
+    for n in (5, 10, 20, 50, 100):
         d[f"ema{n}"] = close / close.ewm(span=n, adjust=False).mean() - 1
+    d["sma_cross_50_200"] = d["sma50"] - d["sma200"]
+    d["ema_cross_20_100"] = d["ema20"] - d["ema100"]
     for n in (5, 10, 20, 50):
         d[f"gma{n}"] = close / np.exp(log_c.rolling(n).mean()) - 1
     d["gma_cross_5_20"] = d["gma5"] - d["gma20"]
@@ -485,7 +549,7 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d["trend_strength"] = (close - close.rolling(50).mean()) / (close.rolling(20).std() + 1e-12)
     return d.replace([np.inf, -np.inf], np.nan)
 
-def estimate_trend_duration(raw: pd.DataFrame, direction: str, atr_mult: float = 0.5):
+def estimate_trend_duration(raw: pd.DataFrame, direction: str, atr_mult: float = 0.5, bar_minutes: int = 1):
     if raw is None or len(raw) < 200 or direction not in ("صعود", "هبوط"):
         return {"duration_est": None, "duration_lo": None, "duration_hi": None, "confidence": 0.0}
     d = indicators(raw.tail(3000))
@@ -524,17 +588,17 @@ def estimate_trend_duration(raw: pd.DataFrame, direction: str, atr_mult: float =
     if len(durations) < 8:
         return {"duration_est": None, "duration_lo": None, "duration_hi": None, "confidence": 0.0}
     arr = np.array(durations, dtype=float)
-    med, lo, hi = int(np.median(arr)), int(np.percentile(arr, 25)), int(np.percentile(arr, 75))
+    med, lo, hi = (
+        int(round(np.median(arr) * bar_minutes)),
+        int(round(np.percentile(arr, 25) * bar_minutes)),
+        int(round(np.percentile(arr, 75) * bar_minutes)),
+    )
     iqr = max(hi - lo, 1)
     conf = min(0.95, 0.25 + 0.5 * (1 - iqr / (med + iqr)) + 0.02 * min(len(arr), 40))
     return {"duration_est": med, "duration_lo": lo, "duration_hi": hi, "confidence": float(conf)}
 
 def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 35):
-    sub = raw.tail(3500).copy()
-    sub.index = pd.to_datetime(sub["ts"], unit="s", utc=True)
-    bars = sub.resample(f"{tf}min", origin="epoch").agg(
-        {"open": "first", "high": "max", "low": "min", "close": "last"}
-    ).dropna(subset=["open", "high", "low", "close"])
+    bars = raw.tail(MAX_TIMEFRAME_CANDLES).copy()
     closes = bars["close"].to_numpy()
     opens = bars["open"].to_numpy()
     highs = bars["high"].to_numpy()
@@ -569,7 +633,7 @@ def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 
     return probs
 
 def statistical_geo_probs(raw: pd.DataFrame, tf: int):
-    sub = raw.tail(max(120, tf * 20)).reset_index(drop=True)
+    sub = raw.tail(MAX_TIMEFRAME_CANDLES).reset_index(drop=True)
     closes = sub["close"].to_numpy()
     if len(closes) < 50:
         return {1: 0.5, 2: 0.5, 3: 0.5}
@@ -580,21 +644,18 @@ def statistical_geo_probs(raw: pd.DataFrame, tf: int):
     holt_steps = {1: 0.0, 2: 0.0, 3: 0.0}
     if STATSMODELS_AVAILABLE:
         try:
-            agg = log_c[::tf]
-            if len(agg) >= 15:
-                fcast = Holt(agg, damped_trend=True, initialization_method="estimated").fit(optimized=True).forecast(3)
-                prev = agg[-1]
+            if len(log_c) >= 15:
+                fcast = Holt(log_c, damped_trend=True, initialization_method="estimated").fit(optimized=True).forecast(3)
                 for s in STEPS:
-                    holt_steps[s] = float(fcast[s - 1] - prev)
-                    prev = float(fcast[s - 1])
+                    holt_steps[s] = float(fcast[s - 1] - log_c[-1])
         except Exception:
             pass
     z = (log_c[-1] - np.mean(log_c[-40:])) / (np.std(log_c[-40:]) + 1e-9)
-    mr_bias = -0.22 * z * vol * np.sqrt(tf)
+    mr_bias = -0.22 * z * vol
     out = {}
     for s in STEPS:
-        drift = slope * tf * (r_val ** 2) + 0.5 * holt_steps[s] + mr_bias * (0.6 ** (s - 1))
-        z_pred = drift / (vol * np.sqrt(tf) + 1e-6)
+        drift = slope * s * (r_val ** 2) + 0.5 * holt_steps[s] + mr_bias * (0.6 ** (s - 1))
+        z_pred = drift / (vol * np.sqrt(s) + 1e-6)
         out[s] = float(sp_stats.norm.cdf(np.clip(z_pred * 1.4, -2.5, 2.5)))
     return out
 
@@ -605,17 +666,17 @@ def compute_sample_weights(df_subset, pair, tf, step):
     n = len(df_subset)
     recency = np.exp(np.linspace(-1.2, 0.0, n))
     move_pct = df_subset["future_ret"].abs().to_numpy()
-    atr_pct = df_subset["atr14"].to_numpy() * np.sqrt(tf)
+    atr_pct = df_subset["atr14"].to_numpy() * np.sqrt(step)
     clarity_w = np.where(move_pct < (0.10 * np.maximum(atr_pct, 1e-6)), 0.35, 1.15)
     err_boost, mistakes = np.ones(n, dtype=float), 0
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT created_ts, hit, prob_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' ORDER BY created_ts DESC LIMIT 1000",
-            (pair, tf, step)
+            "SELECT feature_ts, hit, prob_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=? AND feature_ts IS NOT NULL ORDER BY created_ts DESC LIMIT 1000",
+            (pair, tf, step, MODEL_VERSION)
         ).fetchall()
         c.close()
-        fb = {int(cts): (int(hit), float(pup or 0.5)) for cts, hit, pup in rows if hit is not None}
+        fb = {int(ts): (int(hit), float(pup or 0.5)) for ts, hit, pup in rows if hit is not None}
         if fb:
             for idx, t in enumerate(df_subset["ts"].astype(int).to_numpy()):
                 if t in fb:
@@ -631,9 +692,13 @@ def compute_sample_weights(df_subset, pair, tf, step):
     return w / np.mean(w), mistakes
 
 def train_tf_step(raw, pair, tf, step):
-    raw_train = raw.tail(18000).copy()
+    if raw is not None and not raw.empty:
+        last_train_ts[(pair, tf, step)] = int(raw["ts"].iloc[-1])
+    raw_train = closed_timeframe_bars(raw, tf)
+    if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
+        return f"بيانات غير كافية للفريم {tf}د: {len(raw_train)}/{MIN_TIMEFRAME_BARS_FOR_TRAINING} شمعة مكتملة."
     d = indicators(raw_train)
-    s0, s1 = (step - 1) * tf, step * tf
+    s0, s1 = step - 1, step
     p_start = d["close"].shift(-s0) if s0 > 0 else d["close"]
     d["future_ret"] = d["close"].shift(-s1) / p_start - 1.0
     d["target"] = (d["future_ret"] > 0).astype(int)
@@ -649,6 +714,7 @@ def train_tf_step(raw, pair, tf, step):
     w_all, mistakes = compute_sample_weights(d, pair, tf, step)
     X_tr, y_tr, w_tr = X.iloc[:split], y.iloc[:split], w_all[:split]
     X_te, y_te = X.iloc[purge_end:], y.iloc[purge_end:]
+    baseline_brier = brier_score_loss(y_te, np.full(len(y_te), y_te.mean()))
 
     def make_cands(y_ref):
         cands = {}
@@ -683,14 +749,21 @@ def train_tf_step(raw, pair, tf, step):
     if not scored:
         return "فشل GBDT."
     scored.sort(key=lambda x: x[0], reverse=True)
-    top3 = scored[:3]
+    skill_candidates = [item for item in scored if item[2] > 0.50 and item[3] < baseline_brier]
+    top3 = (skill_candidates or scored)[:3]
     full_cands = make_cands(y)
     members = []
     for score, name, *_ in top3:
         est = full_cands[name]
         est.fit(X, y, sample_weight=w_all)
         members.append((name, max(0.05, score), est))
-    brain = FusionGBDTBrain(members)
+    has_skill = bool(skill_candidates)
+    if not has_skill:
+        add_log(
+            f"⚠️ لم يتجاوز GBDT خط الأساس خارج العينة "
+            f"(Brier الأساسي={baseline_brier:.4f})؛ سيُستبعد من الإشارة حتى يتحسن."
+        )
+    brain = FusionGBDTBrain(members, usable=has_skill)
     gbdt_models[(pair, tf, step)] = brain
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
 
@@ -698,16 +771,27 @@ def train_tf_step(raw, pair, tf, step):
     if TORCH_AVAILABLE and len(d) >= 600:
         try:
             scaler = StandardScaler().fit(X_tr.to_numpy(dtype=np.float32))
-            xt_tr = torch.from_numpy(scaler.transform(X_tr.to_numpy(dtype=np.float32)))
-            yt_tr = torch.from_numpy(y_tr.to_numpy(dtype=np.float32))
-            wt_tr = torch.from_numpy(w_tr.astype(np.float32))
-            xt_te = torch.from_numpy(scaler.transform(X_te.to_numpy(dtype=np.float32)))
+            scaled_all = scaler.transform(X.to_numpy(dtype=np.float32))
+            all_windows = np.stack([
+                scaled_all[i - SEQUENCE_LENGTH + 1:i + 1]
+                for i in range(SEQUENCE_LENGTH - 1, len(scaled_all))
+            ])
+            sequence_rows = np.arange(SEQUENCE_LENGTH - 1, len(d))
+            train_mask = sequence_rows < split
+            test_mask = sequence_rows >= purge_end
+            if train_mask.sum() < 100 or test_mask.sum() < 35:
+                raise ValueError("بيانات التسلسل غير كافية للتدريب والاختبار")
+            xt_tr = torch.from_numpy(all_windows[train_mask].astype(np.float32))
+            yt_tr = torch.from_numpy(y.to_numpy(dtype=np.float32)[sequence_rows[train_mask]])
+            wt_tr = torch.from_numpy(w_all[sequence_rows[train_mask]].astype(np.float32))
+            xt_te = torch.from_numpy(all_windows[test_mask].astype(np.float32))
+            y_te_seq = y.to_numpy(dtype=np.int64)[sequence_rows[test_mask]]
             pos_w = torch.tensor(
-                [max(float(len(y_tr) - y_tr.sum()), 1.0) / max(float(y_tr.sum()), 1.0)],
+                [max(float(len(yt_tr) - yt_tr.sum()), 1.0) / max(float(yt_tr.sum()), 1.0)],
                 dtype=torch.float32
             )
             torch.manual_seed(42)
-            net = DeepCandleResNet(len(FEATURES))
+            net = DeepCandleSequenceNet(len(FEATURES))
             opt = torch.optim.AdamW(net.parameters(), lr=0.001, weight_decay=1e-3)
             net.train()
             for _ in range(10):
@@ -727,7 +811,7 @@ def train_tf_step(raw, pair, tf, step):
             net.eval()
             with torch.no_grad():
                 p_dl = torch.sigmoid(net(xt_te)).numpy()
-            dl_bal = balanced_accuracy_score(y_te, (p_dl >= 0.5).astype(int))
+            dl_bal = balanced_accuracy_score(y_te_seq, (p_dl >= 0.5).astype(int))
             dl_bal_txt = f"{dl_bal:.3f}"
             if dl_bal > 0.505:
                 dl_models[(pair, tf, step)] = (net, scaler, dl_bal)
@@ -761,12 +845,15 @@ def _load_dl(pair, tf, step):
         return None
     mp, sp = MODEL_DIR / f"{pair}_{tf}m_c{step}_dl.pt", MODEL_DIR / f"{pair}_{tf}m_c{step}_dl_scaler.joblib"
     if mp.exists() and sp.exists():
-        scaler = joblib.load(sp)
-        net = DeepCandleResNet(len(FEATURES))
-        net.load_state_dict(torch.load(mp, map_location="cpu", weights_only=True))
-        net.eval()
-        dl_models[k] = (net, scaler, 0.52)
-        return dl_models[k]
+        try:
+            scaler = joblib.load(sp)
+            net = DeepCandleSequenceNet(len(FEATURES))
+            net.load_state_dict(torch.load(mp, map_location="cpu", weights_only=True))
+            net.eval()
+            dl_models[k] = (net, scaler, 0.52)
+            return dl_models[k]
+        except Exception as exc:
+            add_log(f"تعذر تحميل نموذج التسلسل {mp.name}: {type(exc).__name__}: {exc}")
     return None
 
 def get_adaptive_engine_weights(pair, tf, step):
@@ -774,8 +861,8 @@ def get_adaptive_engine_weights(pair, tf, step):
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT pat_prob, stat_prob, gbdt_prob, dl_prob, kronos_prob, actual_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' ORDER BY id DESC LIMIT 40",
-            (pair, tf, step)
+            "SELECT pat_prob, stat_prob, gbdt_prob, dl_prob, kronos_prob, actual_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=? ORDER BY id DESC LIMIT 40",
+            (pair, tf, step, MODEL_VERSION)
         ).fetchall()
         c.close()
         if len(rows) < 10:
@@ -789,24 +876,55 @@ def get_adaptive_engine_weights(pair, tf, step):
     except Exception:
         return base
 
+def candle_pattern_labels(row):
+    patterns = []
+    if int(row.get("bullish_engulfing", 0) or 0):
+        patterns.append("ابتلاع شرائي")
+    if int(row.get("bearish_engulfing", 0) or 0):
+        patterns.append("ابتلاع بيعي")
+    if int(row.get("hammer", 0) or 0):
+        patterns.append("مطرقة")
+    if int(row.get("shooting_star", 0) or 0):
+        patterns.append("نجمة ساقطة")
+    if int(row.get("doji", 0) or 0):
+        patterns.append("دوجي")
+    return patterns or ["لا يوجد نمط واضح"]
+
+def aggregate_duration(timeframe_summary, direction):
+    durations = [
+        item["duration"] for item in timeframe_summary.values()
+        if item["direction"] == direction and item["duration"].get("duration_est") is not None
+    ]
+    if not durations:
+        return {"duration_est": None, "duration_lo": None, "duration_hi": None, "confidence": 0.0}
+    return {
+        "duration_est": int(np.median([d["duration_est"] for d in durations])),
+        "duration_lo": int(np.median([d["duration_lo"] for d in durations])),
+        "duration_hi": int(np.median([d["duration_hi"] for d in durations])),
+        "confidence": float(np.mean([d["confidence"] for d in durations])),
+        "timeframes": len(durations),
+    }
+
 # ===========================================================================
 # 6. التوقع + التليجرام بوقت تهدئة قابل للتحكم
 # ===========================================================================
 def build_forecast(raw, pair):
+    raw = completed_minute_candles(raw)
     if raw is None or len(raw) < 150:
         return {"ok": False, "note": "بيانات غير كافية"}
-    d = indicators(raw.tail(600))
-    valid = d.dropna(subset=FEATURES)
-    if valid.empty:
-        return {"ok": False, "note": "المؤشرات غير مكتملة"}
-    row = valid.iloc[-1:]
-    x_np = row[FEATURES].to_numpy(dtype=np.float32)
-
     kronos_map = kronos_predict_all(raw, pair)
-    tf_cards, all_items = {}, []
+    tf_cards, all_items, timeframe_summary = {}, [], {}
     for tf in TIMEFRAMES:
-        pat_probs = pattern_match_probs(raw, tf)
-        stat_probs = statistical_geo_probs(raw, tf)
+        bars = closed_timeframe_bars(raw, tf)
+        d = indicators(bars)
+        valid = d.dropna(subset=FEATURES).tail(MAX_TIMEFRAME_CANDLES)
+        if len(valid) < SEQUENCE_LENGTH:
+            tf_cards[str(tf)] = []
+            continue
+        row = valid.iloc[-1:]
+        x_np = row[FEATURES].to_numpy(dtype=np.float32)
+        pat_probs = pattern_match_probs(bars, tf)
+        stat_probs = statistical_geo_probs(bars, tf)
         candles_3 = []
         for step in STEPS:
             brain = _load_gbdt(pair, tf, step)
@@ -815,8 +933,10 @@ def build_forecast(raw, pair):
             dl_p = None
             if dl_obj is not None:
                 net, scaler, _ = dl_obj
+                seq = valid[FEATURES].tail(SEQUENCE_LENGTH).to_numpy(dtype=np.float32)
+                seq = scaler.transform(seq).reshape(1, SEQUENCE_LENGTH, len(FEATURES))
                 with torch.no_grad():
-                    dl_p = float(torch.sigmoid(net(torch.from_numpy(scaler.transform(x_np)))).item())
+                    dl_p = float(torch.sigmoid(net(torch.from_numpy(seq))).item())
             pat_p, stat_p = pat_probs[step], stat_probs[step]
             kr_p = kronos_map.get((tf, step))
 
@@ -832,26 +952,61 @@ def build_forecast(raw, pair):
             tot_w = sum(w[k] for k, _ in parts)
             final_up = sum(w[k] * p for k, p in parts) / tot_w
             conf = max(final_up, 1.0 - final_up)
-            direction = "محايد" if conf < 0.53 else ("صعود" if final_up >= 0.5 else "هبوط")
+            direction = "محايد" if conf < 0.55 else ("صعود" if final_up >= 0.5 else "هبوط")
             item = {
                 "key": f"{tf}_{step}", "tf": tf, "step": step, "offset_min": step * tf,
                 "direction": direction, "prob_up": final_up, "conf": conf,
                 "pat_prob": pat_p, "stat_prob": stat_p, "gbdt_prob": gbdt_p,
                 "dl_prob": dl_p, "kronos_prob": kr_p,
+                "feature_ts": int(bars["ts"].iloc[-1]),
+                "feature_price": float(bars["close"].iloc[-1]),
+                "patterns": candle_pattern_labels(valid.iloc[-1]),
             }
             candles_3.append(item)
             all_items.append(item)
         tf_cards[str(tf)] = candles_3
+        first = candles_3[0]
+        tf_duration = estimate_trend_duration(
+            bars, first["direction"], bar_minutes=tf
+        )
+        timeframe_summary[str(tf)] = {
+            "direction": first["direction"],
+            "prob_up": first["prob_up"],
+            "confidence": first["conf"],
+            "duration": tf_duration,
+            "patterns": first["patterns"],
+            "candles_used": len(bars),
+        }
 
-    if not any(_load_gbdt(pair, tf, 1) is not None for tf in TIMEFRAMES):
-        return {"ok": False, "note": "جاري تدريب نماذج الشمعات الـ 3..."}
-
-    p15 = tf_cards["15"][0]
-    dur = estimate_trend_duration(raw, p15["direction"])
+    overview = [
+        tf_cards[str(tf)][0] for tf in TIMEFRAMES
+        if tf_cards.get(str(tf))
+    ]
+    if not overview:
+        return {"ok": False, "note": "لا توجد شموع مكتملة كافية للفريمات"}
+    prob_up = float(np.mean([item["prob_up"] for item in overview]))
+    up_votes = sum(item["prob_up"] >= 0.5 for item in overview)
+    down_votes = len(overview) - up_votes
+    agreement = max(up_votes, down_votes) / len(overview)
+    confidence = max(prob_up, 1.0 - prob_up)
+    direction = (
+        "محايد" if confidence < 0.55 or agreement < 0.75
+        else ("صعود" if prob_up >= 0.5 else "هبوط")
+    )
+    dur = aggregate_duration(timeframe_summary, direction)
+    all_patterns = sorted({
+        pattern
+        for item in timeframe_summary.values()
+        for pattern in item["patterns"]
+        if pattern != "لا يوجد نمط واضح"
+    })
     return {
         "ok": True, "pair": pair, "ref_price": float(raw.iloc[-1]["close"]), "ref_ts": int(raw.iloc[-1]["ts"]),
-        "direction": p15["direction"], "prob_up": p15["prob_up"], "prob_down": 1.0 - p15["prob_up"],
-        "dir_confidence": p15["conf"], "duration": dur, "tf_cards": tf_cards, "all_items": all_items,
+        "direction": direction, "prob_up": prob_up, "prob_down": 1.0 - prob_up,
+        "dir_confidence": confidence, "agreement": agreement, "duration": dur,
+        "tf_cards": tf_cards, "timeframe_summary": timeframe_summary,
+        "patterns": all_patterns, "all_items": all_items,
+        "candles_per_timeframe": MAX_TIMEFRAME_CANDLES,
         "updated_at": datetime.now().strftime("%H:%M:%S"),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -959,34 +1114,46 @@ def save_all_3candle_predictions(fc):
     c = db_connect()
     dur = fc.get("duration") or {}
     rng = f"{dur.get('duration_lo')}-{dur.get('duration_hi')}" if dur.get("duration_est") else ""
+    saved_features = {
+        (int(tf), int(step)): int(ts)
+        for tf, step, ts in c.execute(
+            "SELECT timeframe, step_idx, MAX(feature_ts) FROM predictions WHERE pair=? AND model_version=? AND feature_ts IS NOT NULL GROUP BY timeframe, step_idx",
+            (fc["pair"], MODEL_VERSION)
+        ).fetchall()
+    }
     for it in fc["all_items"]:
         p_up = it["prob_up"]
         tf, step = it["tf"], it["step"]
+        feature_ts = int(it["feature_ts"])
+        if feature_ts <= saved_features.get((tf, step), -1):
+            continue
         direction = "صعود" if p_up >= 0.5 else "هبوط"
-        start_ts = fc["ref_ts"] + (step - 1) * tf * INTERVAL
-        end_ts = fc["ref_ts"] + step * tf * INTERVAL
+        start_ts = feature_ts + (tf - 1 + (step - 1) * tf) * INTERVAL
+        end_ts = feature_ts + (tf - 1 + step * tf) * INTERVAL
         try:
             cur = c.execute("""
                 INSERT OR IGNORE INTO predictions(
                     pair, created_ts, created_at, ref_price, direction,
                     target_horizon, timeframe, step_idx, start_ts, end_ts,
                     prob_up, prob_down, pat_prob, stat_prob, gbdt_prob, dl_prob, kronos_prob,
-                    duration_est, duration_lo, duration_hi, duration_confidence,
+                    duration_est, duration_lo, duration_hi, duration_confidence, feature_ts,
                     model_name, model_version, status
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
-                fc["pair"], fc["ref_ts"], fc["created_at"], fc["ref_price"], direction,
+                fc["pair"], fc["ref_ts"], fc["created_at"], it["feature_price"], direction,
                 tf * step, tf, step, start_ts, end_ts,
                 p_up, 1.0 - p_up, it["pat_prob"], it["stat_prob"], it["gbdt_prob"],
                 it["dl_prob"], it["kronos_prob"],
                 dur.get("duration_est"), dur.get("duration_lo"), dur.get("duration_hi"), dur.get("confidence"),
+                it["feature_ts"],
                 f"Fusion-{tf}m-C{step}", MODEL_VERSION, "PENDING"
             ))
             if cur.rowcount > 0:
+                saved_features[(tf, step)] = feature_ts
                 with state_lock:
                     pending_sheet_preds.append({
                         "id": cur.lastrowid, "pair": fc["pair"], "created_at": fc["created_at"],
-                        "ref_price": fc["ref_price"], "direction": direction,
+                        "ref_price": it["feature_price"], "direction": direction,
                         "target_horizon": f"{tf}m-C{step}", "prob_up": round(p_up, 4),
                         "duration_est": dur.get("duration_est") or "", "duration_range": rng,
                         "model_name": f"Fusion-{tf}m-C{step}", "status": "PENDING"
@@ -1004,8 +1171,8 @@ def settle_pending_predictions(raw, pair):
     times = sorted(price_map.keys())
     c = db_connect()
     rows = c.execute(
-        "SELECT id, created_ts, created_at, ref_price, direction, timeframe, step_idx, start_ts, end_ts, prob_up, duration_est, duration_lo, duration_hi FROM predictions WHERE pair=? AND status='PENDING'",
-        (pair,)
+        "SELECT id, created_ts, created_at, ref_price, direction, timeframe, step_idx, start_ts, end_ts, prob_up, duration_est, duration_lo, duration_hi FROM predictions WHERE pair=? AND status='PENDING' AND model_version=?",
+        (pair, MODEL_VERSION)
     ).fetchall()
     retrain_candidates = set()
     for pid, cts, cat, ref, direction, tf, step, sts, ets, p_up, dest, dlo, dhi in rows:
@@ -1035,8 +1202,8 @@ def settle_pending_predictions(raw, pair):
             })
     c.commit()
     for tf, step in retrain_candidates:
-        mistakes = c.execute("SELECT COUNT(*) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND hit=0", (pair, tf, step)).fetchone()[0]
-        last12 = c.execute("SELECT hit FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' ORDER BY id DESC LIMIT 12", (pair, tf, step)).fetchall()
+        mistakes = c.execute("SELECT COUNT(*) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND hit=0 AND model_version=?", (pair, tf, step, MODEL_VERSION)).fetchone()[0]
+        last12 = c.execute("SELECT hit FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=? ORDER BY id DESC LIMIT 12", (pair, tf, step, MODEL_VERSION)).fetchall()
         recent_acc = (sum(x[0] for x in last12) / len(last12)) if len(last12) >= 10 else 1.0
         prev_m = last_mistake_retrain.get((pair, tf, step), 0)
         if time.time() - last_retrain_ts.get((pair, tf, step), 0) > 600 and (mistakes - prev_m >= 6 or recent_acc < 0.50):
@@ -1048,16 +1215,16 @@ def settle_pending_predictions(raw, pair):
 
 def prediction_stats(pair):
     c = db_connect()
-    row = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END), SUM(CASE WHEN hit=0 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND status='SETTLED'", (pair,)).fetchone()
-    pending = c.execute("SELECT COUNT(*) FROM predictions WHERE pair=? AND status='PENDING'", (pair,)).fetchone()[0]
+    row = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END), SUM(CASE WHEN hit=0 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND status='SETTLED' AND model_version=?", (pair, MODEL_VERSION)).fetchone()
+    pending = c.execute("SELECT COUNT(*) FROM predictions WHERE pair=? AND status='PENDING' AND model_version=?", (pair, MODEL_VERSION)).fetchone()[0]
     by_tf_step = {}
     for tf in TIMEFRAMES:
         for step in STEPS:
-            r = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED'", (pair, tf, step)).fetchone()
+            r = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=?", (pair, tf, step, MODEL_VERSION)).fetchone()
             sc, hc = int(r[0] or 0), int(r[1] or 0)
             by_tf_step[f"{tf}_{step}"] = {"settled": sc, "hits": hc, "hit_rate": (100.0 * hc / sc) if sc else None}
     by_pair = []
-    for p, cnt, hits in c.execute("SELECT pair, COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE status='SETTLED' GROUP BY pair ORDER BY COUNT(*) DESC").fetchall():
+    for p, cnt, hits in c.execute("SELECT pair, COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE status='SETTLED' AND model_version=? GROUP BY pair ORDER BY COUNT(*) DESC", (MODEL_VERSION,)).fetchall():
         cnt, hits = int(cnt or 0), int(hits or 0)
         by_pair.append({"pair": p, "settled": cnt, "hits": hits, "hit_rate": (100.0 * hits / cnt) if cnt else None})
     c.close()
@@ -1124,6 +1291,9 @@ def enqueue_training(raw, pair, force=False):
     added = 0
 
     for tf in TIMEFRAMES:
+        tf_bar_count = len(closed_timeframe_bars(raw, tf))
+        if tf_bar_count < MIN_TIMEFRAME_BARS_FOR_TRAINING:
+            continue
         for step in STEPS:
             k = (pair, tf, step)
 
@@ -1139,7 +1309,7 @@ def enqueue_training(raw, pair, force=False):
                     last_train_ts[k] = previous_ts
                 new_data = previous_ts is None or latest_ts - previous_ts >= RETRAIN_NEW_CANDLES * INTERVAL
 
-                if not (force or model_missing or new_data):
+                if not (force or new_data):
                     continue
 
                 training_jobs.add(k)
