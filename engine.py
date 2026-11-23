@@ -597,41 +597,6 @@ def estimate_trend_duration(raw: pd.DataFrame, direction: str, atr_mult: float =
     conf = min(0.95, 0.25 + 0.5 * (1 - iqr / (med + iqr)) + 0.02 * min(len(arr), 40))
     return {"duration_est": med, "duration_lo": lo, "duration_hi": hi, "confidence": float(conf)}
 
-def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 35):
-    bars = raw.tail(MAX_TIMEFRAME_CANDLES).copy()
-    closes = bars["close"].to_numpy()
-    opens = bars["open"].to_numpy()
-    highs = bars["high"].to_numpy()
-    lows = bars["low"].to_numpy()
-    if len(closes) < win + max(STEPS) + 60:
-        return {1: 0.5, 2: 0.5, 3: 0.5}
-    rets = np.diff(np.log(np.maximum(closes, 1e-9)))
-    bodies = (closes[1:] - opens[1:]) / np.maximum(highs[1:] - lows[1:], 1e-9)
-    feats = np.column_stack([rets, bodies])
-    query = feats[-win:].flatten()
-    q_norm = np.linalg.norm(query)
-    if q_norm < 1e-9:
-        return {1: 0.5, 2: 0.5, 3: 0.5}
-    query = query / q_norm
-    candidate_count = len(closes) - win - max(STEPS)
-    if candidate_count < 40:
-        return {1: 0.5, 2: 0.5, 3: 0.5}
-    mat = np.array([feats[i:i + win].flatten() for i in range(candidate_count)])
-    sims = (mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)) @ query
-    top_idx = np.argsort(sims)[-top_k:]
-    probs = {}
-    for s in STEPS:
-        up_w, tot_w = 0.0, 0.0
-        for idx in top_idx:
-            sim = max(0.05, float(sims[idx]))
-            p0 = closes[idx + win]
-            p1 = closes[idx + win + s]
-            if p1 > p0:
-                up_w += sim
-            tot_w += sim
-        probs[s] = (up_w / tot_w) if tot_w > 0 else 0.5
-    return probs
-
 def statistical_geo_probs(raw: pd.DataFrame, tf: int):
     sub = raw.tail(MAX_TIMEFRAME_CANDLES).reset_index(drop=True)
     closes = sub["close"].to_numpy()
@@ -692,8 +657,6 @@ def compute_sample_weights(df_subset, pair, tf, step):
     return w / np.mean(w), mistakes
 
 def train_tf_step(raw, pair, tf, step):
-    if raw is not None and not raw.empty:
-        last_train_ts[(pair, tf, step)] = int(raw["ts"].iloc[-1])
     raw_train = closed_timeframe_bars(raw, tf)
     if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
         return f"بيانات غير كافية للفريم {tf}د: {len(raw_train)}/{MIN_TIMEFRAME_BARS_FOR_TRAINING} شمعة مكتملة."
@@ -857,38 +820,24 @@ def _load_dl(pair, tf, step):
     return None
 
 def get_adaptive_engine_weights(pair, tf, step):
-    base = {"pat": 0.16, "stat": 0.16, "gbdt": 0.38, "dl": 0.12, "kronos": 0.18}
+    base = {"stat": 0.22, "gbdt": 0.42, "dl": 0.12, "kronos": 0.24}
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT pat_prob, stat_prob, gbdt_prob, dl_prob, kronos_prob, actual_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=? ORDER BY id DESC LIMIT 40",
+            "SELECT stat_prob, gbdt_prob, dl_prob, kronos_prob, actual_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=? ORDER BY id DESC LIMIT 40",
             (pair, tf, step, MODEL_VERSION)
         ).fetchall()
         c.close()
         if len(rows) < 10:
             return base
         scores = {}
-        for idx, name in enumerate(["pat", "stat", "gbdt", "dl", "kronos"]):
-            valid = [(r[idx], r[5]) for r in rows if r[idx] is not None]
+        for idx, name in enumerate(["stat", "gbdt", "dl", "kronos"], start=0):
+            valid = [(r[idx], r[4]) for r in rows if r[idx] is not None]
             scores[name] = max(0.05, (sum(1 for p, a in valid if (1 if p >= 0.5 else 0) == a) / len(valid)) ** 2) if len(valid) >= 6 else base[name]
         tot = sum(scores.values())
         return {k: v / tot for k, v in scores.items()}
     except Exception:
         return base
-
-def candle_pattern_labels(row):
-    patterns = []
-    if int(row.get("bullish_engulfing", 0) or 0):
-        patterns.append("ابتلاع شرائي")
-    if int(row.get("bearish_engulfing", 0) or 0):
-        patterns.append("ابتلاع بيعي")
-    if int(row.get("hammer", 0) or 0):
-        patterns.append("مطرقة")
-    if int(row.get("shooting_star", 0) or 0):
-        patterns.append("نجمة ساقطة")
-    if int(row.get("doji", 0) or 0):
-        patterns.append("دوجي")
-    return patterns or ["لا يوجد نمط واضح"]
 
 def aggregate_duration(timeframe_summary, direction):
     durations = [
@@ -923,7 +872,6 @@ def build_forecast(raw, pair):
             continue
         row = valid.iloc[-1:]
         x_np = row[FEATURES].to_numpy(dtype=np.float32)
-        pat_probs = pattern_match_probs(bars, tf)
         stat_probs = statistical_geo_probs(bars, tf)
         candles_3 = []
         for step in STEPS:
@@ -937,11 +885,11 @@ def build_forecast(raw, pair):
                 seq = scaler.transform(seq).reshape(1, SEQUENCE_LENGTH, len(FEATURES))
                 with torch.no_grad():
                     dl_p = float(torch.sigmoid(net(torch.from_numpy(seq))).item())
-            pat_p, stat_p = pat_probs[step], stat_probs[step]
+            stat_p = stat_probs[step]
             kr_p = kronos_map.get((tf, step))
 
             w = get_adaptive_engine_weights(pair, tf, step)
-            parts = [("pat", pat_p), ("stat", stat_p)]
+            parts = [("stat", stat_p)]
             if gbdt_p is not None:
                 parts.append(("gbdt", gbdt_p))
             if dl_p is not None:
@@ -956,11 +904,10 @@ def build_forecast(raw, pair):
             item = {
                 "key": f"{tf}_{step}", "tf": tf, "step": step, "offset_min": step * tf,
                 "direction": direction, "prob_up": final_up, "conf": conf,
-                "pat_prob": pat_p, "stat_prob": stat_p, "gbdt_prob": gbdt_p,
+                "stat_prob": stat_p, "gbdt_prob": gbdt_p,
                 "dl_prob": dl_p, "kronos_prob": kr_p,
                 "feature_ts": int(bars["ts"].iloc[-1]),
                 "feature_price": float(bars["close"].iloc[-1]),
-                "patterns": candle_pattern_labels(valid.iloc[-1]),
             }
             candles_3.append(item)
             all_items.append(item)
@@ -974,7 +921,6 @@ def build_forecast(raw, pair):
             "prob_up": first["prob_up"],
             "confidence": first["conf"],
             "duration": tf_duration,
-            "patterns": first["patterns"],
             "candles_used": len(bars),
         }
 
@@ -994,18 +940,12 @@ def build_forecast(raw, pair):
         else ("صعود" if prob_up >= 0.5 else "هبوط")
     )
     dur = aggregate_duration(timeframe_summary, direction)
-    all_patterns = sorted({
-        pattern
-        for item in timeframe_summary.values()
-        for pattern in item["patterns"]
-        if pattern != "لا يوجد نمط واضح"
-    })
     return {
         "ok": True, "pair": pair, "ref_price": float(raw.iloc[-1]["close"]), "ref_ts": int(raw.iloc[-1]["ts"]),
         "direction": direction, "prob_up": prob_up, "prob_down": 1.0 - prob_up,
         "dir_confidence": confidence, "agreement": agreement, "duration": dur,
         "tf_cards": tf_cards, "timeframe_summary": timeframe_summary,
-        "patterns": all_patterns, "all_items": all_items,
+        "all_items": all_items,
         "candles_per_timeframe": MAX_TIMEFRAME_CANDLES,
         "updated_at": datetime.now().strftime("%H:%M:%S"),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -1142,7 +1082,7 @@ def save_all_3candle_predictions(fc):
             """, (
                 fc["pair"], fc["ref_ts"], fc["created_at"], it["feature_price"], direction,
                 tf * step, tf, step, start_ts, end_ts,
-                p_up, 1.0 - p_up, it["pat_prob"], it["stat_prob"], it["gbdt_prob"],
+                p_up, 1.0 - p_up, None, it["stat_prob"], it["gbdt_prob"],
                 it["dl_prob"], it["kronos_prob"],
                 dur.get("duration_est"), dur.get("duration_lo"), dur.get("duration_hi"), dur.get("confidence"),
                 it["feature_ts"],
@@ -1265,8 +1205,6 @@ def train_loop():
 
             add_log(f"✅ نتيجة التدريب: {info}")
 
-            if pair == current_pair and len(raw) >= 150:
-                latest_forecast = build_forecast(raw, pair)
 
         except Exception as exc:
             add_log(
