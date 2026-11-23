@@ -16,7 +16,8 @@ import joblib
 from scipy import stats as sp_stats
 from iqoptionapi.stable_api import IQ_Option
 
-from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier, ExtraTreesClassifier, RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import balanced_accuracy_score, brier_score_loss
 
@@ -682,6 +683,19 @@ def train_tf_step(raw, pair, tf, step):
 
     def make_cands(y_ref):
         cands = {}
+        cands["ExtraTrees"] = ExtraTreesClassifier(
+            n_estimators=240, max_depth=12, min_samples_leaf=20,
+            max_features=0.75, class_weight="balanced", random_state=42,
+            n_jobs=-1
+        )
+        cands["RandomForest"] = RandomForestClassifier(
+            n_estimators=180, max_depth=10, min_samples_leaf=25,
+            max_features=0.75, class_weight="balanced", random_state=42,
+            n_jobs=-1
+        )
+        cands["Logistic"] = LogisticRegression(
+            C=0.10, max_iter=500, class_weight="balanced", random_state=42
+        )
         if CATBOOST_AVAILABLE:
             cands["CatBoost"] = CatBoostClassifier(iterations=240, depth=6, learning_rate=0.04, l2_leaf_reg=5.0, loss_function="Logloss", auto_class_weights="Balanced", random_seed=42, verbose=0)
         if LIGHTGBM_AVAILABLE:
@@ -727,7 +741,7 @@ def train_tf_step(raw, pair, tf, step):
             f"ℹ️ GBDT لم يتجاوز خط الأساس خارج العينة "
             f"(Brier الأساسي={baseline_brier:.4f})؛ يبقى في وضع توقع احتياطي ولا يُعامل كإشارة مؤكدة."
         )
-    brain = FusionGBDTBrain(members, usable=True)
+    brain = FusionGBDTBrain(members, usable=has_skill)
     gbdt_models[(pair, tf, step)] = brain
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
 
