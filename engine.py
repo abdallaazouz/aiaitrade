@@ -94,8 +94,9 @@ LOCAL_DB = DATA_DIR / "iq_ai_data.sqlite3"
 INTERVAL = 60
 MAX_CANDLES_IN_MEMORY = 40000
 MAX_TIMEFRAME_CANDLES = 1000
+TRAINING_MINUTE_CANDLES = 10000
 SEQUENCE_LENGTH = 64
-MIN_TIMEFRAME_BARS_FOR_TRAINING = 750
+MIN_TIMEFRAME_BARS_FOR_TRAINING = 300
 RETRAIN_NEW_CANDLES = 600
 MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
@@ -657,7 +658,7 @@ def compute_sample_weights(df_subset, pair, tf, step):
     return w / np.mean(w), mistakes
 
 def train_tf_step(raw, pair, tf, step):
-    raw_train = closed_timeframe_bars(raw, tf)
+    raw_train = closed_timeframe_bars(raw, tf, limit=max(750, TRAINING_MINUTE_CANDLES // tf))
     if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
         return f"بيانات غير كافية للفريم {tf}د: {len(raw_train)}/{MIN_TIMEFRAME_BARS_FOR_TRAINING} شمعة مكتملة."
     d = indicators(raw_train)
@@ -666,7 +667,7 @@ def train_tf_step(raw, pair, tf, step):
     d["future_ret"] = d["close"].shift(-s1) / p_start - 1.0
     d["target"] = (d["future_ret"] > 0).astype(int)
     d = d.iloc[:-s1].dropna(subset=FEATURES + ["target", "future_ret"]).reset_index(drop=True)
-    if len(d) < 450 or d["target"].nunique() < 2:
+    if len(d) < 300 or d["target"].nunique() < 2:
         return "بيانات غير كافية."
 
     split = int(len(d) * 0.72)
@@ -723,10 +724,10 @@ def train_tf_step(raw, pair, tf, step):
     has_skill = bool(skill_candidates)
     if not has_skill:
         add_log(
-            f"⚠️ لم يتجاوز GBDT خط الأساس خارج العينة "
-            f"(Brier الأساسي={baseline_brier:.4f})؛ سيُستبعد من الإشارة حتى يتحسن."
+            f"ℹ️ GBDT لم يتجاوز خط الأساس خارج العينة "
+            f"(Brier الأساسي={baseline_brier:.4f})؛ يبقى في وضع توقع احتياطي ولا يُعامل كإشارة مؤكدة."
         )
-    brain = FusionGBDTBrain(members, usable=has_skill)
+    brain = FusionGBDTBrain(members, usable=True)
     gbdt_models[(pair, tf, step)] = brain
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
 
@@ -947,6 +948,7 @@ def build_forecast(raw, pair):
         "tf_cards": tf_cards, "timeframe_summary": timeframe_summary,
         "all_items": all_items,
         "candles_per_timeframe": MAX_TIMEFRAME_CANDLES,
+        "training_candles": int(min(TRAINING_MINUTE_CANDLES, len(raw))),
         "updated_at": datetime.now().strftime("%H:%M:%S"),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -1150,7 +1152,11 @@ def settle_pending_predictions(raw, pair):
             last_mistake_retrain[(pair, tf, step)] = mistakes
             last_retrain_ts[(pair, tf, step)] = time.time()
             add_log(f"🔄 تصحيح ذاتي ({pair} | {tf}د ش{step}): أخطاء={mistakes}")
-            train_queue.put((raw.copy(), pair, tf, step))
+            k = (pair, tf, step)
+            with training_lock:
+                if k not in training_jobs:
+                    training_jobs.add(k)
+                    train_queue.put((raw.copy(), pair, tf, step))
     c.close()
 
 def prediction_stats(pair):
