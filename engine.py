@@ -668,8 +668,10 @@ def train_tf_step(raw, pair, tf, step):
     d["future_ret"] = d["close"].shift(-s1) / p_start - 1.0
     d["target"] = (d["future_ret"] > 0).astype(int)
     d = d.iloc[:-s1].dropna(subset=FEATURES + ["target", "future_ret"]).reset_index(drop=True)
-    if len(d) < 300 or d["target"].nunique() < 2:
-        return "بيانات غير كافية."
+    if len(d) < 300:
+        return f"بيانات غير كافية: سُجِّل {len(d)} صفا تعلميا بعد المؤشرات، المطلوب 300."
+    if d["target"].nunique() < 2:
+        return "بيانات غير كافية: لم يوجد في العينة صف واحد على الأقل للصعود والهبوط."
 
     split = int(len(d) * 0.72)
     purge_end = min(split + s1, len(d) - 45)
@@ -892,14 +894,19 @@ def build_forecast(raw, pair):
         for step in STEPS:
             brain = _load_gbdt(pair, tf, step)
             gbdt_p = brain.predict_gbdt(row[FEATURES]) if brain is not None else None
+            gbdt_status = "غير مدرب"
+            if brain is not None:
+                gbdt_status = "مدرب ومشارك" if brain.usable else "مدرب ومرفوض خارج العينة"
             dl_obj = _load_dl(pair, tf, step)
             dl_p = None
+            dl_status = "غير مدرب"
             if dl_obj is not None:
                 net, scaler, _ = dl_obj
                 seq = valid[FEATURES].tail(SEQUENCE_LENGTH).to_numpy(dtype=np.float32)
                 seq = scaler.transform(seq).reshape(1, SEQUENCE_LENGTH, len(FEATURES))
                 with torch.no_grad():
                     dl_p = float(torch.sigmoid(net(torch.from_numpy(seq))).item())
+                dl_status = "مدرب ومشارك"
             stat_p = stat_probs[step]
             kr_p = kronos_map.get((tf, step))
 
@@ -921,6 +928,7 @@ def build_forecast(raw, pair):
                 "direction": direction, "prob_up": final_up, "conf": conf,
                 "stat_prob": stat_p, "gbdt_prob": gbdt_p,
                 "dl_prob": dl_p, "kronos_prob": kr_p,
+                "gbdt_status": gbdt_status, "dl_status": dl_status,
                 "feature_ts": int(bars["ts"].iloc[-1]),
                 "feature_price": float(bars["close"].iloc[-1]),
             }
