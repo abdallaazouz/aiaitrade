@@ -72,10 +72,10 @@ def call_with_timeout(fn, timeout_sec=25):
 # ===========================================================================
 # 1. الإعدادات من GitHub Secrets
 # ===========================================================================
-IQ_EMAIL = os.environ["IQ_EMAIL"].strip()
-IQ_PASSWORD = os.environ["IQ_PASSWORD"]
-APPS_SCRIPT_URL = os.environ["APPS_SCRIPT_URL"].strip()
-SECRET_TOKEN = os.environ["SECRET_TOKEN"].strip()
+IQ_EMAIL = os.environ.get("IQ_EMAIL", "").strip()
+IQ_PASSWORD = os.environ.get("IQ_PASSWORD", "")
+APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
+SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
 MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "17100"))
@@ -92,6 +92,9 @@ MODEL_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_DB = DATA_DIR / "iq_ai_data.sqlite3"
 
 INTERVAL = 60
+MAX_CANDLES_IN_MEMORY = 20000
+RETRAIN_NEW_CANDLES = 600
+MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
 STEPS = (1, 2, 3)
 
@@ -145,6 +148,8 @@ if TORCH_AVAILABLE:
 
 stop_event = threading.Event()
 train_queue = queue.Queue()
+db_init_lock = threading.Lock()
+db_initialized = False
 
 # متابعة مهام التدريب ومنع إضافتها أكثر من مرة
 training_jobs = set()
@@ -152,7 +157,8 @@ training_lock = threading.Lock()
 active_training = None
 
 gbdt_models, dl_models = {}, {}
-last_train_count, last_mistake_retrain, last_retrain_ts = {}, {}, {}
+last_mistake_retrain, last_retrain_ts = {}, {}
+last_train_ts = {}
 
 tg_config = {"enabled": False, "min_conf": 62, "cooldown_min": 60, "candles": ["5_1", "5_2", "5_3"]}
 tg_cooldown_until = {}
@@ -169,7 +175,10 @@ kronos_cache = {}  # (pair, last_ts) -> {(tf, step): prob}
 
 def add_log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        print(line.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
     with state_lock:
         logs_buffer.append(line)
 
@@ -190,6 +199,8 @@ def init_kronos():
         add_log("جاري تحميل Kronos-mini من HuggingFace...")
         tokenizer = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-2k")
         model = Kronos.from_pretrained("NeoQuasar/Kronos-mini")
+        tokenizer.eval()
+        model.eval()
         kronos_predictor = KronosPredictor(model, tokenizer, device="cpu", max_context=512)
         add_log("✅ تم تفعيل نموذج Kronos بنجاح.")
     except Exception as exc:
@@ -210,7 +221,7 @@ def kronos_predict_all(raw: pd.DataFrame, pair: str):
         y_ts = pd.Series(pd.date_range(start=x_ts.iloc[-1] + pd.Timedelta(minutes=1), periods=90, freq="1min"))
         pred_df = kronos_predictor.predict(
             df=x_df, x_timestamp=x_ts, y_timestamp=y_ts,
-            pred_len=90, T=1.0, top_p=0.9, sample_count=3
+            pred_len=90, T=1.0, top_p=0.9, sample_count=3, verbose=False
         )
         closes = pred_df["close"].to_numpy(dtype=float)
         ref_close = float(sub.iloc[-1]["close"])
@@ -237,58 +248,71 @@ def kronos_predict_all(raw: pd.DataFrame, pair: str):
 # 3. قاعدة البيانات
 # ===========================================================================
 def db_connect():
+    global db_initialized
     c = sqlite3.connect(LOCAL_DB, timeout=60)
-    c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS candles(
-            pair TEXT NOT NULL, ts INTEGER NOT NULL,
-            open REAL, high REAL, low REAL, close REAL, volume REAL,
-            PRIMARY KEY(pair, ts)
-        )
-    """)
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS predictions(
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pair TEXT NOT NULL, created_ts INTEGER NOT NULL, created_at TEXT NOT NULL,
-            ref_price REAL NOT NULL, direction TEXT, target_horizon INTEGER,
-            timeframe INTEGER DEFAULT 5, step_idx INTEGER DEFAULT 1,
-            start_ts INTEGER, end_ts INTEGER, start_price REAL,
-            prob_up REAL, prob_down REAL,
-            pat_prob REAL, stat_prob REAL, gbdt_prob REAL, dl_prob REAL, kronos_prob REAL,
-            duration_est INTEGER, duration_lo INTEGER, duration_hi INTEGER,
-            duration_confidence REAL, model_name TEXT, model_version TEXT,
-            status TEXT NOT NULL DEFAULT 'PENDING',
-            actual_price REAL, actual_up INTEGER, hit INTEGER,
-            settled_at TEXT, data_note TEXT
-        )
-    """)
-    cols = {r[1] for r in c.execute("PRAGMA table_info(predictions)").fetchall()}
-    for col_name, col_type in [
-        ("timeframe", "INTEGER DEFAULT 5"), ("step_idx", "INTEGER DEFAULT 1"),
-        ("start_ts", "INTEGER"), ("end_ts", "INTEGER"), ("start_price", "REAL"),
-        ("pat_prob", "REAL"), ("stat_prob", "REAL"), ("gbdt_prob", "REAL"),
-        ("dl_prob", "REAL"), ("kronos_prob", "REAL"),
-    ]:
-        if col_name not in cols:
-            c.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
+    if not db_initialized:
+        with db_init_lock:
+            if not db_initialized:
+                try:
+                    c.execute("PRAGMA journal_mode=WAL")
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS candles(
+                            pair TEXT NOT NULL, ts INTEGER NOT NULL,
+                            open REAL, high REAL, low REAL, close REAL, volume REAL,
+                            PRIMARY KEY(pair, ts)
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS predictions(
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            pair TEXT NOT NULL, created_ts INTEGER NOT NULL, created_at TEXT NOT NULL,
+                            ref_price REAL NOT NULL, direction TEXT, target_horizon INTEGER,
+                            timeframe INTEGER DEFAULT 5, step_idx INTEGER DEFAULT 1,
+                            start_ts INTEGER, end_ts INTEGER, start_price REAL,
+                            prob_up REAL, prob_down REAL,
+                            pat_prob REAL, stat_prob REAL, gbdt_prob REAL, dl_prob REAL, kronos_prob REAL,
+                            duration_est INTEGER, duration_lo INTEGER, duration_hi INTEGER,
+                            duration_confidence REAL, model_name TEXT, model_version TEXT,
+                            status TEXT NOT NULL DEFAULT 'PENDING',
+                            actual_price REAL, actual_up INTEGER, hit INTEGER,
+                            settled_at TEXT, data_note TEXT
+                        )
+                    """)
+                    cols = {r[1] for r in c.execute("PRAGMA table_info(predictions)").fetchall()}
+                    for col_name, col_type in [
+                        ("timeframe", "INTEGER DEFAULT 5"), ("step_idx", "INTEGER DEFAULT 1"),
+                        ("start_ts", "INTEGER"), ("end_ts", "INTEGER"), ("start_price", "REAL"),
+                        ("pat_prob", "REAL"), ("stat_prob", "REAL"), ("gbdt_prob", "REAL"),
+                        ("dl_prob", "REAL"), ("kronos_prob", "REAL"),
+                    ]:
+                        if col_name not in cols:
+                            c.execute(f"ALTER TABLE predictions ADD COLUMN {col_name} {col_type}")
 
-    c.execute("DROP INDEX IF EXISTS idx_pred_unique")
-    c.execute("""
-        UPDATE predictions
-        SET timeframe = CASE WHEN target_horizon IN (5,10,15,30) THEN target_horizon ELSE 5 END,
-            step_idx = 1
-        WHERE start_ts IS NULL
-    """)
-    c.execute("""
-        DELETE FROM predictions
-        WHERE id NOT IN (SELECT MAX(id) FROM predictions GROUP BY pair, created_ts, timeframe, step_idx)
-    """)
-    c.execute("""
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_tf_step
-        ON predictions(pair, created_ts, timeframe, step_idx)
-    """)
-    c.commit()
+                    c.execute("DROP INDEX IF EXISTS idx_pred_unique")
+                    c.execute("""
+                        UPDATE predictions
+                        SET timeframe = CASE WHEN target_horizon IN (5,10,15,30) THEN target_horizon ELSE 5 END,
+                            step_idx = 1
+                        WHERE start_ts IS NULL
+                    """)
+                    c.execute("""
+                        DELETE FROM predictions
+                        WHERE id NOT IN (SELECT MAX(id) FROM predictions GROUP BY pair, created_ts, timeframe, step_idx)
+                    """)
+                    c.execute("""
+                        CREATE UNIQUE INDEX IF NOT EXISTS idx_pred_tf_step
+                        ON predictions(pair, created_ts, timeframe, step_idx)
+                    """)
+                    c.execute("""
+                        CREATE INDEX IF NOT EXISTS idx_predictions_pair_status
+                        ON predictions(pair, status, timeframe, step_idx)
+                    """)
+                    c.commit()
+                    db_initialized = True
+                except Exception:
+                    c.close()
+                    raise
     return c
 
 def save_candles(c, pair, candles):
@@ -315,7 +339,17 @@ def save_candles(c, pair, candles):
     return c.total_changes - before, max_ts
 
 def read_candles(c, pair):
-    df = pd.read_sql_query("SELECT ts, open, high, low, close, volume FROM candles WHERE pair=? ORDER BY ts", c, params=(pair,))
+    df = pd.read_sql_query(
+        """
+        SELECT ts, open, high, low, close, volume
+        FROM (
+            SELECT ts, open, high, low, close, volume
+            FROM candles WHERE pair=? ORDER BY ts DESC LIMIT ?
+        )
+        ORDER BY ts
+        """,
+        c, params=(pair, MAX_CANDLES_IN_MEMORY)
+    )
     if not df.empty:
         df["time"] = pd.to_datetime(df["ts"], unit="s", utc=True)
     return df
@@ -433,16 +467,16 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d["bullish_engulfing"] = (prev_bear & bull & (op <= close.shift(1)) & (close >= op.shift(1))).astype(int)
     d["bearish_engulfing"] = (prev_bull & bear & (op >= close.shift(1)) & (close <= op.shift(1))).astype(int)
 
-   hour = d["time"].dt.hour
-   weekday = d["time"].dt.day_of_week
+    hour = d["time"].dt.hour
+    weekday = d["time"].dt.day_of_week
 
-   d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
-   d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
-   d["weekday_sin"] = np.sin(2 * np.pi * weekday / 7)
-   d["weekday_cos"] = np.cos(2 * np.pi * weekday / 7)
+    d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
+    d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
+    d["weekday_sin"] = np.sin(2 * np.pi * weekday / 7)
+    d["weekday_cos"] = np.cos(2 * np.pi * weekday / 7)
 
-   ret1 = close.pct_change(1)
-   vol20 = ret1.rolling(20).std()
+    ret1 = close.pct_change(1)
+    vol20 = ret1.rolling(20).std()
     d["vol_z"] = (ret1 - ret1.rolling(20).mean()) / (vol20 + 1e-12)
     d["ret_vol"] = ret1 / (vol20 + 1e-12)
     d["mom10"] = close / close.shift(10) - 1
@@ -496,14 +530,16 @@ def estimate_trend_duration(raw: pd.DataFrame, direction: str, atr_mult: float =
     return {"duration_est": med, "duration_lo": lo, "duration_hi": hi, "confidence": float(conf)}
 
 def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 35):
-    sub = raw.tail(3500).reset_index(drop=True)
-    step_bars = max(1, tf // 5)
-    closes = sub["close"].to_numpy()[::step_bars]
-    opens = sub["open"].to_numpy()[::step_bars]
-    highs = sub["high"].to_numpy()[::step_bars]
-    lows = sub["low"].to_numpy()[::step_bars]
-    bar_len = 5 if tf == 5 else (2 if tf == 10 else (3 if tf == 15 else 6))
-    if len(closes) < win + 3 * bar_len + 60:
+    sub = raw.tail(3500).copy()
+    sub.index = pd.to_datetime(sub["ts"], unit="s", utc=True)
+    bars = sub.resample(f"{tf}min", origin="epoch").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last"}
+    ).dropna(subset=["open", "high", "low", "close"])
+    closes = bars["close"].to_numpy()
+    opens = bars["open"].to_numpy()
+    highs = bars["high"].to_numpy()
+    lows = bars["low"].to_numpy()
+    if len(closes) < win + max(STEPS) + 60:
         return {1: 0.5, 2: 0.5, 3: 0.5}
     rets = np.diff(np.log(np.maximum(closes, 1e-9)))
     bodies = (closes[1:] - opens[1:]) / np.maximum(highs[1:] - lows[1:], 1e-9)
@@ -513,10 +549,10 @@ def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 
     if q_norm < 1e-9:
         return {1: 0.5, 2: 0.5, 3: 0.5}
     query = query / q_norm
-    max_idx = len(feats) - win - 3 * bar_len - 2
-    if max_idx < 40:
+    candidate_count = len(closes) - win - max(STEPS)
+    if candidate_count < 40:
         return {1: 0.5, 2: 0.5, 3: 0.5}
-    mat = np.array([feats[i:i + win].flatten() for i in range(max_idx)])
+    mat = np.array([feats[i:i + win].flatten() for i in range(candidate_count)])
     sims = (mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)) @ query
     top_idx = np.argsort(sims)[-top_k:]
     probs = {}
@@ -524,8 +560,8 @@ def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 
         up_w, tot_w = 0.0, 0.0
         for idx in top_idx:
             sim = max(0.05, float(sims[idx]))
-            p0 = closes[idx + win + (s - 1) * bar_len]
-            p1 = closes[idx + win + s * bar_len]
+            p0 = closes[idx + win]
+            p1 = closes[idx + win + s]
             if p1 > p0:
                 up_w += sim
             tot_w += sim
@@ -533,7 +569,7 @@ def pattern_match_probs(raw: pd.DataFrame, tf: int, win: int = 12, top_k: int = 
     return probs
 
 def statistical_geo_probs(raw: pd.DataFrame, tf: int):
-    sub = raw.tail(max(120, tf * 12)).reset_index(drop=True)
+    sub = raw.tail(max(120, tf * 20)).reset_index(drop=True)
     closes = sub["close"].to_numpy()
     if len(closes) < 50:
         return {1: 0.5, 2: 0.5, 3: 0.5}
@@ -544,7 +580,7 @@ def statistical_geo_probs(raw: pd.DataFrame, tf: int):
     holt_steps = {1: 0.0, 2: 0.0, 3: 0.0}
     if STATSMODELS_AVAILABLE:
         try:
-            agg = log_c[::max(1, tf // 2)]
+            agg = log_c[::tf]
             if len(agg) >= 15:
                 fcast = Holt(agg, damped_trend=True, initialization_method="estimated").fit(optimized=True).forecast(3)
                 prev = agg[-1]
@@ -575,7 +611,7 @@ def compute_sample_weights(df_subset, pair, tf, step):
     try:
         c = db_connect()
         rows = c.execute(
-            "SELECT created_ts, hit, prob_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED'",
+            "SELECT created_ts, hit, prob_up FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' ORDER BY created_ts DESC LIMIT 1000",
             (pair, tf, step)
         ).fetchall()
         c.close()
@@ -589,8 +625,8 @@ def compute_sample_weights(df_subset, pair, tf, step):
                         mistakes += 1
                     else:
                         err_boost[idx] = 1.10
-    except Exception:
-        pass
+    except Exception as exc:
+        add_log(f"تعذر تحميل أوزان التعلم من نتائج التوقعات: {exc}")
     w = recency * clarity_w * err_boost
     return w / np.mean(w), mistakes
 
@@ -627,46 +663,22 @@ def train_tf_step(raw, pair, tf, step):
         return cands
 
     scored = []
+    for name, clf in make_cands(y_tr).items():
+        try:
+            add_log(f"🔬 اختبار الخوارزمية: {name} | {tf}د ش{step}")
+            clf.fit(X_tr, y_tr, sample_weight=w_tr)
+            p_all = clf.predict_proba(X_te)
+            classes = list(clf.classes_)
+            if 1 not in classes:
+                add_log(f"⚠️ {name}: فئة الصعود غير موجودة")
+                continue
 
-for name, clf in make_cands(y_tr).items():
-    try:
-        add_log(
-            f"🔬 اختبار الخوارزمية: {name} | "
-            f"{tf}د ش{step}"
-        )
-
-        clf.fit(X_tr, y_tr, sample_weight=w_tr)
-
-        p_all = clf.predict_proba(X_te)
-        classes = list(clf.classes_)
-
-        if 1 not in classes:
-            add_log(f"⚠️ {name}: فئة الصعود غير موجودة")
-            continue
-
-        bal = balanced_accuracy_score(
-            y_te, clf.predict(X_te)
-        )
-
-        brier = brier_score_loss(
-            y_te, p_all[:, classes.index(1)]
-        )
-
-        scored.append(
-            (bal - 0.35 * brier, name, bal, brier)
-        )
-
-        add_log(
-            f"📊 {name}: Balanced Accuracy={bal:.4f} "
-            f"| Brier={brier:.4f}"
-        )
-
-    except Exception as exc:
-        add_log(
-            f"❌ فشل {name}: "
-            f"{type(exc).__name__}: {exc}"
-        )
-        continue
+            bal = balanced_accuracy_score(y_te, clf.predict(X_te))
+            brier = brier_score_loss(y_te, p_all[:, classes.index(1)])
+            scored.append((bal - 0.35 * brier, name, bal, brier))
+            add_log(f"📊 {name}: Balanced Accuracy={bal:.4f} | Brier={brier:.4f}")
+        except Exception as exc:
+            add_log(f"❌ فشل {name}: {type(exc).__name__}: {exc}")
 
     if not scored:
         return "فشل GBDT."
@@ -674,10 +686,10 @@ for name, clf in make_cands(y_tr).items():
     top3 = scored[:3]
     full_cands = make_cands(y)
     members = []
-    for sc, name, *_ in top3:
+    for score, name, *_ in top3:
         est = full_cands[name]
         est.fit(X, y, sample_weight=w_all)
-        members.append((name, max(0.05, sc), est))
+        members.append((name, max(0.05, score), est))
     brain = FusionGBDTBrain(members)
     gbdt_models[(pair, tf, step)] = brain
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
@@ -690,7 +702,10 @@ for name, clf in make_cands(y_tr).items():
             yt_tr = torch.from_numpy(y_tr.to_numpy(dtype=np.float32))
             wt_tr = torch.from_numpy(w_tr.astype(np.float32))
             xt_te = torch.from_numpy(scaler.transform(X_te.to_numpy(dtype=np.float32)))
-            pos_w = torch.tensor([max(float(len(y_tr) - y_tr.sum()), 1.0) / max(float(y_tr.sum()), 1.0)], dtype=torch.float32)
+            pos_w = torch.tensor(
+                [max(float(len(y_tr) - y_tr.sum()), 1.0) / max(float(y_tr.sum()), 1.0)],
+                dtype=torch.float32
+            )
             torch.manual_seed(42)
             net = DeepCandleResNet(len(FEATURES))
             opt = torch.optim.AdamW(net.parameters(), lr=0.001, weight_decay=1e-3)
@@ -702,7 +717,11 @@ for name, clf in make_cands(y_tr).items():
                     if len(idx) < 4:
                         continue
                     opt.zero_grad()
-                    loss = (F.binary_cross_entropy_with_logits(net(xt_tr[idx]), yt_tr[idx], pos_weight=pos_w, reduction="none") * wt_tr[idx]).mean()
+                    loss = (
+                        F.binary_cross_entropy_with_logits(
+                            net(xt_tr[idx]), yt_tr[idx], pos_weight=pos_w, reduction="none"
+                        ) * wt_tr[idx]
+                    ).mean()
                     loss.backward()
                     opt.step()
             net.eval()
@@ -714,10 +733,10 @@ for name, clf in make_cands(y_tr).items():
                 dl_models[(pair, tf, step)] = (net, scaler, dl_bal)
                 torch.save(net.state_dict(), MODEL_DIR / f"{pair}_{tf}m_c{step}_dl.pt")
                 joblib.dump(scaler, MODEL_DIR / f"{pair}_{tf}m_c{step}_dl_scaler.joblib")
-        except Exception:
-            pass
+        except Exception as exc:
+            add_log(f"⚠️ تعذر تدريب الشبكة العميقة ({tf}د ش{step}): {exc}")
 
-    last_train_count[(pair, tf, step)] = len(raw)
+    last_train_ts[(pair, tf, step)] = int(raw["ts"].iloc[-1])
     return f"{tf}د ش{step}: GBDT={top3[0][2]:.3f} DL={dl_bal_txt} أخطاء={mistakes}"
 
 def _load_gbdt(pair, tf, step):
@@ -726,8 +745,12 @@ def _load_gbdt(pair, tf, step):
         return gbdt_models[k]
     p = MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib"
     if p.exists():
-        gbdt_models[k] = joblib.load(p)
-        return gbdt_models[k]
+        try:
+            gbdt_models[k] = joblib.load(p)
+            last_train_ts.setdefault(k, int(p.stat().st_mtime))
+            return gbdt_models[k]
+        except Exception as exc:
+            add_log(f"تعذر تحميل النموذج {p.name}: {type(exc).__name__}: {exc}")
     return None
 
 def _load_dl(pair, tf, step):
@@ -938,8 +961,6 @@ def save_all_3candle_predictions(fc):
     rng = f"{dur.get('duration_lo')}-{dur.get('duration_hi')}" if dur.get("duration_est") else ""
     for it in fc["all_items"]:
         p_up = it["prob_up"]
-        if abs(p_up - 0.5) < 0.015:
-            continue
         tf, step = it["tf"], it["step"]
         direction = "صعود" if p_up >= 0.5 else "هبوط"
         start_ts = fc["ref_ts"] + (step - 1) * tf * INTERVAL
@@ -970,7 +991,8 @@ def save_all_3candle_predictions(fc):
                         "duration_est": dur.get("duration_est") or "", "duration_range": rng,
                         "model_name": f"Fusion-{tf}m-C{step}", "status": "PENDING"
                     })
-        except Exception:
+        except Exception as exc:
+            add_log(f"تعذر حفظ توقع {fc['pair']} ({tf}د ش{step}): {exc}")
             continue
     c.commit()
     c.close()
@@ -1092,31 +1114,13 @@ def train_loop():
             active_training = None
             train_queue.task_done()
 
-    global latest_forecast
-    while not stop_event.is_set():
-        try:
-            job = train_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        if job is None:
-            break
-        raw, pair, tf, step = job
-        try:
-            info = train_tf_step(raw, pair, tf, step)
-            add_log(f"تدريب: {info}")
-            if pair == current_pair and len(raw) >= 150:
-                latest_forecast = build_forecast(raw, pair)
-        except Exception as exc:
-            add_log(f"خطأ تدريب ({tf}د ش{step}): {exc}")
-        finally:
-            train_queue.task_done()
-
 
 def enqueue_training(raw, pair, force=False):
-    if len(raw) < 480:
-        add_log(f"انتظار البيانات: {len(raw)}/480 شمعة")
+    if len(raw) < MIN_CANDLES_FOR_TRAINING:
+        add_log(f"انتظار البيانات: {len(raw)}/{MIN_CANDLES_FOR_TRAINING} شمعة")
         return
 
+    latest_ts = int(raw["ts"].iloc[-1])
     added = 0
 
     for tf in TIMEFRAMES:
@@ -1128,8 +1132,12 @@ def enqueue_training(raw, pair, force=False):
                     continue
 
                 model_missing = _load_gbdt(pair, tf, step) is None
-                previous_count = last_train_count.get(k, 0)
-                new_data = len(raw) - previous_count >= 240
+                previous_ts = last_train_ts.get(k)
+                if previous_ts is None and not model_missing:
+                    model_path = MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib"
+                    previous_ts = int(model_path.stat().st_mtime) if model_path.exists() else 0
+                    last_train_ts[k] = previous_ts
+                new_data = previous_ts is None or latest_ts - previous_ts >= RETRAIN_NEW_CANDLES * INTERVAL
 
                 if not (force or model_missing or new_data):
                     continue
@@ -1169,7 +1177,11 @@ def push_to_cloud(raw, pair, max_ts, gaps, status_text):
         "predictions": preds,
     }
     try:
-        requests.post(APPS_SCRIPT_URL, json=payload, timeout=12)
+        response = requests.post(APPS_SCRIPT_URL, json=payload, timeout=12)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok") is False:
+            raise RuntimeError(result.get("error", "رفض Apps Script تحديث الحالة"))
     except Exception as exc:
         add_log(f"تعذر الإرسال للسحابة: {exc}")
 
@@ -1186,14 +1198,28 @@ def poll_cloud_command():
             tg_config = new_cfg
             add_log(f"⚙️ تحديث تليجرام: مفعل={tg_config.get('enabled')} | تهدئة={tg_config.get('cooldown_min')}د")
         return r.get("command")
-    except Exception:
+    except Exception as exc:
+        add_log(f"تعذر استطلاع أمر السحابة: {exc}")
         return None
 
 if __name__ == "__main__":
+    missing_secrets = [
+        name for name, value in {
+            "IQ_EMAIL": IQ_EMAIL,
+            "IQ_PASSWORD": IQ_PASSWORD,
+            "APPS_SCRIPT_URL": APPS_SCRIPT_URL,
+            "SECRET_TOKEN": SECRET_TOKEN,
+        }.items() if not value
+    ]
+    if missing_secrets:
+        raise SystemExit(f"إعدادات GitHub Secrets المطلوبة غير موجودة: {', '.join(missing_secrets)}")
+
     start_ts = time.time()
     threading.Thread(target=train_loop, daemon=True).start()
     c = db_connect()
     api = None
+    last_forecast_key = None
+    last_settlement_key = None
 
     # إرسال فوري للويب منذ الثانية الأولى حتى ترى الحالة الحية
     add_log("🚀 بدء تشغيل المحرك على GitHub Actions...")
@@ -1252,13 +1278,19 @@ if __name__ == "__main__":
                 raw = read_candles(c, current_pair)
                 gaps = detect_gaps(raw)
 
-                settle_pending_predictions(raw, current_pair)
+                data_key = (current_pair, int(raw.iloc[-1]["ts"])) if not raw.empty else None
+                if data_key is not None and (n > 0 or data_key != last_settlement_key):
+                    settle_pending_predictions(raw, current_pair)
+                    last_settlement_key = data_key
                 if len(raw) >= 150:
-                    latest_forecast = build_forecast(raw, current_pair)
-                    if latest_forecast.get("ok"):
-                        if n > 0:
-                            save_all_3candle_predictions(latest_forecast)
-                        maybe_send_telegram(latest_forecast, raw)
+                    forecast_key = data_key
+                    if n > 0 or forecast_key != last_forecast_key:
+                        latest_forecast = build_forecast(raw, current_pair)
+                        last_forecast_key = forecast_key
+                        if latest_forecast.get("ok"):
+                            if n > 0:
+                                save_all_3candle_predictions(latest_forecast)
+                            maybe_send_telegram(latest_forecast, raw)
                 if n > 0:
                     add_log(f"شموع جديدة={n} | الإجمالي={len(raw)}")
                     enqueue_training(raw, current_pair)
