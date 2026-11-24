@@ -101,6 +101,8 @@ MIN_TIMEFRAME_BARS_FOR_TRAINING = 300
 RETRAIN_NEW_CANDLES = 600
 MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
+INITIAL_HISTORY_CANDLES = MAX_TIMEFRAME_CANDLES * max(TIMEFRAMES)
+HISTORY_CHUNK_SIZE = 1000
 STEPS = (1, 2, 3)
 
 FEATURES = [
@@ -351,6 +353,60 @@ def save_candles(c, pair, candles):
     c.executemany("INSERT OR IGNORE INTO candles(pair,ts,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)", rows)
     c.commit()
     return c.total_changes - before, max_ts
+
+def load_initial_history(api, c, pair):
+    """Load enough minute bars to build up to 1000 bars for the largest timeframe."""
+    cursor = int(time.time())
+    page = 0
+
+    while True:
+        count = c.execute(
+            "SELECT COUNT(*) FROM candles WHERE pair=?", (pair,)
+        ).fetchone()[0]
+        if count >= INITIAL_HISTORY_CANDLES:
+            break
+
+        candles = call_with_timeout(
+            lambda end=cursor: api.get_candles(
+                pair, INTERVAL, HISTORY_CHUNK_SIZE, end
+            ),
+            25,
+        )
+        if not candles:
+            add_log(f"انتهى سجل الشموع المتاح لـ {pair} بعد {count} شمعة.")
+            break
+
+        timestamps = []
+        for item in candles:
+            try:
+                timestamps.append(int(item["from"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        if not timestamps:
+            add_log(f"تعذر متابعة تحميل التاريخ لـ {pair}: بيانات الشموع بلا توقيت صالح.")
+            break
+
+        oldest_ts = min(timestamps)
+        if oldest_ts >= cursor:
+            add_log(f"توقف تحميل التاريخ لـ {pair}: المصدر لم يُرجع شموعًا أقدم.")
+            break
+
+        added, _ = save_candles(c, pair, candles)
+        page += 1
+        if page == 1 or page % 5 == 0:
+            count = c.execute(
+                "SELECT COUNT(*) FROM candles WHERE pair=?", (pair,)
+            ).fetchone()[0]
+            add_log(
+                f"تحميل التاريخ {pair}: {count}/{INITIAL_HISTORY_CANDLES} "
+                f"شمعة دقيقة | دفعة جديدة={added}"
+            )
+        cursor = oldest_ts - 1
+
+    count = c.execute(
+        "SELECT COUNT(*) FROM candles WHERE pair=?", (pair,)
+    ).fetchone()[0]
+    return count
 
 def read_candles(c, pair):
     df = pd.read_sql_query(
@@ -659,7 +715,7 @@ def compute_sample_weights(df_subset, pair, tf, step):
     return w / np.mean(w), mistakes
 
 def train_tf_step(raw, pair, tf, step):
-    raw_train = closed_timeframe_bars(raw, tf, limit=max(750, TRAINING_MINUTE_CANDLES // tf))
+    raw_train = closed_timeframe_bars(raw, tf, limit=MAX_TIMEFRAME_CANDLES)
     if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
         return f"بيانات غير كافية للفريم {tf}د: {len(raw_train)}/{MIN_TIMEFRAME_BARS_FOR_TRAINING} شمعة مكتملة."
     d = indicators(raw_train)
@@ -673,15 +729,21 @@ def train_tf_step(raw, pair, tf, step):
     if d["target"].nunique() < 2:
         return "بيانات غير كافية: لم يوجد في العينة صف واحد على الأقل للصعود والهبوط."
 
-    split = int(len(d) * 0.72)
-    purge_end = min(split + s1, len(d) - 45)
-    if purge_end >= len(d) - 35:
+    split = int(len(d) * 0.60)
+    validation_end = int(len(d) * 0.80)
+    validation_start = split + s1
+    test_start = validation_end + s1
+    if validation_start >= validation_end or test_start >= len(d) - 35:
         return "بيانات اختبار غير كافية."
     X, y = d[FEATURES].astype(float), d["target"].astype(int)
     w_all, mistakes = compute_sample_weights(d, pair, tf, step)
     X_tr, y_tr, w_tr = X.iloc[:split], y.iloc[:split], w_all[:split]
-    X_te, y_te = X.iloc[purge_end:], y.iloc[purge_end:]
-    baseline_brier = brier_score_loss(y_te, np.full(len(y_te), y_te.mean()))
+    X_val, y_val = X.iloc[validation_start:validation_end], y.iloc[validation_start:validation_end]
+    X_te, y_te = X.iloc[test_start:], y.iloc[test_start:]
+    if len(X_val) < 35 or len(X_te) < 35:
+        return "بيانات اختبار زمني غير كافية."
+    if any(part.nunique() < 2 for part in (y_tr, y_val, y_te)):
+        return "توزيع الصعود والهبوط غير كافٍ في إحدى عينات الاختبار الزمني."
 
     def make_cands(y_ref):
         cands = {}
@@ -709,39 +771,66 @@ def train_tf_step(raw, pair, tf, step):
         return cands
 
     scored = []
-    for name, clf in make_cands(y_tr).items():
+    validation_models = make_cands(y_tr)
+    for name, clf in validation_models.items():
         try:
-            add_log(f"🔬 اختبار الخوارزمية: {name} | {tf}د ش{step}")
+            add_log(f"🔬 اختيار الخوارزمية زمنيًا: {name} | {tf}د ش{step}")
             clf.fit(X_tr, y_tr, sample_weight=w_tr)
-            p_all = clf.predict_proba(X_te)
+            p_all = clf.predict_proba(X_val)
             classes = list(clf.classes_)
             if 1 not in classes:
-                add_log(f"⚠️ {name}: فئة الصعود غير موجودة")
+                add_log(f"⚠️ {name}: فئة الصعود غير موجودة في التدريب")
                 continue
 
-            bal = balanced_accuracy_score(y_te, clf.predict(X_te))
-            brier = brier_score_loss(y_te, p_all[:, classes.index(1)])
+            bal = balanced_accuracy_score(y_val, clf.predict(X_val))
+            brier = brier_score_loss(y_val, p_all[:, classes.index(1)])
             scored.append((bal - 0.35 * brier, name, bal, brier))
-            add_log(f"📊 {name}: Balanced Accuracy={bal:.4f} | Brier={brier:.4f}")
+            add_log(f"📊 تحقق {name}: Balanced Accuracy={bal:.4f} | Brier={brier:.4f}")
         except Exception as exc:
             add_log(f"❌ فشل {name}: {type(exc).__name__}: {exc}")
 
     if not scored:
         return "فشل GBDT."
     scored.sort(key=lambda x: x[0], reverse=True)
-    skill_candidates = [item for item in scored if item[2] > 0.50 and item[3] < baseline_brier]
-    top3 = (skill_candidates or scored)[:3]
-    full_cands = make_cands(y)
+    top3 = scored[:3]
+    development_end = validation_end
+    X_dev, y_dev, w_dev = X.iloc[:development_end], y.iloc[:development_end], w_all[:development_end]
+    test_baseline_brier = brier_score_loss(
+        y_te, np.full(len(y_te), y_dev.mean())
+    )
+    development_cands = make_cands(y_dev)
     members = []
     for score, name, *_ in top3:
-        est = full_cands[name]
+        est = development_cands[name]
+        est.fit(X_dev, y_dev, sample_weight=w_dev)
+        members.append((name, max(0.05, score), est))
+
+    total_weight = sum(weight for _, weight, _ in members)
+    test_prob_up = np.zeros(len(X_te), dtype=float)
+    for _, weight, est in members:
+        classes = list(est.classes_)
+        if 1 in classes:
+            test_prob_up += weight * est.predict_proba(X_te)[:, classes.index(1)] / total_weight
+    test_bal = balanced_accuracy_score(y_te, (test_prob_up >= 0.5).astype(int))
+    test_brier = brier_score_loss(y_te, test_prob_up)
+    has_skill = test_bal > 0.50 and test_brier < test_baseline_brier
+    final_cands = make_cands(y)
+    members = []
+    for score, name, *_ in top3:
+        est = final_cands[name]
         est.fit(X, y, sample_weight=w_all)
         members.append((name, max(0.05, score), est))
-    has_skill = bool(skill_candidates)
     if not has_skill:
         add_log(
-            f"ℹ️ GBDT لم يتجاوز خط الأساس خارج العينة "
-            f"(Brier الأساسي={baseline_brier:.4f})؛ يبقى في وضع توقع احتياطي ولا يُعامل كإشارة مؤكدة."
+            f"ℹ️ GBDT لم يتجاوز الاختبار الزمني النهائي "
+            f"(BA={test_bal:.3f} | Brier={test_brier:.4f} | "
+            f"الأساس={test_baseline_brier:.4f})؛ لن يشارك في الإجماع."
+        )
+    else:
+        add_log(
+            f"✅ اجتاز GBDT الاختبار الزمني النهائي "
+            f"(BA={test_bal:.3f} | Brier={test_brier:.4f} | "
+            f"الأساس={test_baseline_brier:.4f})."
         )
     brain = FusionGBDTBrain(members, usable=has_skill)
     gbdt_models[(pair, tf, step)] = brain
@@ -758,7 +847,7 @@ def train_tf_step(raw, pair, tf, step):
             ])
             sequence_rows = np.arange(SEQUENCE_LENGTH - 1, len(d))
             train_mask = sequence_rows < split
-            test_mask = sequence_rows >= purge_end
+            test_mask = sequence_rows >= test_start
             if train_mask.sum() < 100 or test_mask.sum() < 35:
                 raise ValueError("بيانات التسلسل غير كافية للتدريب والاختبار")
             xt_tr = torch.from_numpy(all_windows[train_mask].astype(np.float32))
@@ -1398,14 +1487,15 @@ if __name__ == "__main__":
                     api = call_with_timeout(_connect, 25)
                     add_log("✅ اتصال ناجح بـ IQ Option.")
 
-                    hist = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 1000, int(time.time())), 25)
-                    n, max_ts = save_candles(c, current_pair, hist)
+                    load_initial_history(api, c, current_pair)
                     if AUTO_OTC_ON_CLOSED_MARKET and not current_pair.endswith("-OTC"):
-                        if max_ts is None or (int(time.time()) - max_ts > 600):
+                        recent = c.execute(
+                            "SELECT MAX(ts) FROM candles WHERE pair=?", (current_pair,)
+                        ).fetchone()[0]
+                        if recent is None or (int(time.time()) - int(recent) > 600):
                             current_pair = current_pair + "-OTC"
                             add_log(f"تحويل تلقائي للعطلة إلى {current_pair}")
-                            hist = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 1000, int(time.time())), 25)
-                            n, max_ts = save_candles(c, current_pair, hist)
+                            load_initial_history(api, c, current_pair)
                     raw = read_candles(c, current_pair)
                     enqueue_training(raw, current_pair)
 
@@ -1431,7 +1521,10 @@ if __name__ == "__main__":
                     add_log(f"شموع جديدة={n} | الإجمالي={len(raw)}")
                     enqueue_training(raw, current_pair)
 
-                push_to_cloud(raw, current_pair, max_ts, gaps, "يعمل 24/7 على GitHub Actions")
+                push_to_cloud(
+                    raw, current_pair, max_ts, gaps,
+                    "يعمل ضمن جلسة GitHub Actions المجدولة"
+                )
             except Exception as exc:
                 add_log(f"⚠️ مشكلة اتصال مؤقتة: {exc}")
                 api = None
@@ -1439,7 +1532,10 @@ if __name__ == "__main__":
 
             stop_event.wait(15)
     finally:
-        push_to_cloud(read_candles(c, current_pair), current_pair, None, 0, "بانتظار الدورة التالية")
+        push_to_cloud(
+            read_candles(c, current_pair), current_pair, None, 0,
+            "توقفت هذه الجلسة حسب حد GitHub Actions؛ بانتظار التشغيل المجدول التالي"
+        )
         stop_event.set()
         train_queue.put(None)
         c.close()
