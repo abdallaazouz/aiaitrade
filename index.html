@@ -200,10 +200,25 @@
       font-size: 0.79rem; line-height: 1.55; color: #cbd5e1; white-space: pre-wrap;
     }
     .muted { color: var(--muted); font-size: 0.8rem; }
+    .login-screen { max-width: 430px; margin: 8vh auto 0; }
+    .login-screen h2 { margin-top: 0; }
+    .login-screen form { display: grid; gap: 12px; }
+    .login-screen input { width: 100%; }
+    .login-error { color: #f87171; min-height: 1.2em; }
   </style>
 </head>
 <body>
-<div class="container">
+<div id="loginScreen" class="login-screen card">
+  <h2>تسجيل الدخول</h2>
+  <div class="muted">أدخل بيانات الحساب المسجل في Google Sheet.</div>
+  <form id="loginForm">
+    <input id="loginUsername" type="text" autocomplete="username" placeholder="اسم المستخدم" required />
+    <input id="loginPassword" type="password" autocomplete="current-password" placeholder="كلمة المرور" required />
+    <button id="loginButton" type="submit">دخول</button>
+    <div id="loginError" class="login-error" role="alert"></div>
+  </form>
+</div>
+<div id="appContainer" class="container hidden">
 
   <!-- الرأس + شريط التنقل -->
   <div class="card">
@@ -221,7 +236,7 @@
           <span id="connDot" class="dot"></span>
           <span id="connText">غير متصل</span>
         </div>
-        <button class="secondary sm" onclick="toggleConnPanel()">⚙️ الاتصال</button>
+        <button class="secondary sm" onclick="logoutUser()">تسجيل الخروج</button>
         <div class="tabs">
           <button id="btnTabMain" class="tab-btn active" onclick="showTab('main')">📊 التوقعات</button>
           <button id="btnTabTg" class="tab-btn" onclick="showTab('tg')">📲 التليجرام</button>
@@ -229,13 +244,6 @@
       </div>
     </div>
 
-    <!-- لوحة الاتصال (تُخفى تلقائيًا بعد الحفظ والاتصال) -->
-    <div id="connPanel" class="row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--border);">
-      <input id="apiUrl" type="text" placeholder="رابط Google Apps Script (/exec)" style="flex:2; min-width:240px;" />
-      <input id="apiToken" type="password" placeholder="Secret Token" style="flex:1; min-width:140px;" />
-      <button onclick="saveConfig()">حفظ والاتصال</button>
-      <button class="secondary" onclick="copyQuickBookmark()">🔗 نسخ رابط الدخول السريع</button>
-    </div>
   </div>
 
   <!-- تبويب إعدادات التليجرام -->
@@ -387,8 +395,7 @@
   ];
 
   let audioCtx = null, lastAlertKey = "", timer = null, lastState = null, tgLoaded = false;
-  const apiUrlEl = document.getElementById("apiUrl");
-  const apiTokenEl = document.getElementById("apiToken");
+  let sessionToken = "";
   const pairSelect = document.getElementById("pairSelect");
 
   // بناء مربعات الـ 12 شمعة داخل تبويب التليجرام
@@ -411,47 +418,83 @@
     document.getElementById("btnTabTg").classList.toggle("active", name === "tg");
   }
 
-  function toggleConnPanel(forceState) {
-    const p = document.getElementById("connPanel");
-    if (typeof forceState === "boolean") p.classList.toggle("hidden", !forceState);
-    else p.classList.toggle("hidden");
+  function callServer(method, args) {
+    return new Promise((resolve, reject) => {
+      const runner = google.script.run
+        .withSuccessHandler(resolve)
+        .withFailureHandler(error => reject(new Error(error.message || String(error))));
+      switch (method) {
+        case "login": runner.login(args[0], args[1]); break;
+        case "getStateForClient": runner.getStateForClient(args[0]); break;
+        case "sendCommandForClient": runner.sendCommandForClient(args[0], args[1]); break;
+        case "saveTelegramConfigForClient": runner.saveTelegramConfigForClient(args[0], args[1]); break;
+        case "logout": runner.logout(args[0]); break;
+        default: reject(new Error("طلب غير معروف"));
+      }
+    });
   }
 
-  function loadConfig() {
-    const hashParams = new URLSearchParams(location.hash.replace(/^#/, ""));
-    const hUrl = hashParams.get("url");
-    const hTok = hashParams.get("token");
-    if (hUrl) localStorage.setItem("iq_api_url", hUrl);
-    if (hTok) localStorage.setItem("iq_api_token", hTok);
-
-    apiUrlEl.value = localStorage.getItem("iq_api_url") || "";
-    apiTokenEl.value = localStorage.getItem("iq_api_token") || "";
-
-    if (apiUrlEl.value && apiTokenEl.value) {
-      toggleConnPanel(false);
-      startPolling();
+  async function loadConfig() {
+    sessionToken = sessionStorage.getItem("iq_session") || "";
+    if (!sessionToken) return showLogin();
+    try {
+      const result = await callServer("getStateForClient", [sessionToken]);
+      if (!result.ok) throw new Error("انتهت الجلسة");
+      showApp(result.state);
+    } catch {
+      sessionStorage.removeItem("iq_session");
+      sessionToken = "";
+      showLogin("انتهت الجلسة؛ سجل الدخول مجددًا.");
     }
   }
 
-  function saveConfig() {
-    const u = apiUrlEl.value.trim(), t = apiTokenEl.value.trim();
-    if (!u || !t) return alert("أدخل رابط Apps Script والـ Token.");
-    localStorage.setItem("iq_api_url", u);
-    localStorage.setItem("iq_api_token", t);
+  function showLogin(message = "") {
+    document.getElementById("loginScreen").classList.remove("hidden");
+    document.getElementById("appContainer").classList.add("hidden");
+    document.getElementById("loginError").textContent = message;
+  }
+
+  function showApp(state) {
+    document.getElementById("loginScreen").classList.add("hidden");
+    document.getElementById("appContainer").classList.remove("hidden");
     tgLoaded = false;
-    toggleConnPanel(false);
+    renderState(state);
     startPolling();
   }
 
-  function copyQuickBookmark() {
-    const u = apiUrlEl.value.trim(), t = apiTokenEl.value.trim();
-    if (!u || !t) return alert("أدخل الرابط والـ Token أولًا.");
-    const link = `${location.origin}${location.pathname}#url=${encodeURIComponent(u)}&token=${encodeURIComponent(t)}`;
-    navigator.clipboard.writeText(link).then(
-      () => alert("تم نسخ رابط الدخول السريع — احفظه في المفضلة ليفتح متصلًا دائمًا بدون كتابة!"),
-      () => prompt("انسخ الرابط واحفظه في المفضلة:", link)
-    );
+  async function submitLogin(event) {
+    event.preventDefault();
+    const button = document.getElementById("loginButton");
+    const errorEl = document.getElementById("loginError");
+    button.disabled = true;
+    errorEl.textContent = "";
+    try {
+      const result = await callServer("login", [
+        document.getElementById("loginUsername").value,
+        document.getElementById("loginPassword").value
+      ]);
+      if (!result.ok) throw new Error(result.error || "تعذر تسجيل الدخول.");
+      sessionToken = result.token;
+      sessionStorage.setItem("iq_session", sessionToken);
+      document.getElementById("loginPassword").value = "";
+      const state = await callServer("getStateForClient", [sessionToken]);
+      showApp(state.state);
+    } catch (error) {
+      errorEl.textContent = error.message || "تعذر تسجيل الدخول.";
+    } finally {
+      button.disabled = false;
+    }
   }
+
+  async function logoutUser() {
+    if (timer) clearInterval(timer);
+    try { await callServer("logout", [sessionToken]); } catch {}
+    sessionStorage.removeItem("iq_session");
+    sessionToken = "";
+    showLogin();
+  }
+
+  document.getElementById("loginForm").addEventListener("submit", submitLogin);
 
   function setCooldownPreset(mins) {
     document.getElementById("tgCooldownMin").value = mins;
@@ -491,47 +534,36 @@
   }
 
   async function fetchState() {
-    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
-    if (!url || !token) return;
     const dot = document.getElementById("connDot"), txt = document.getElementById("connText");
     try {
-      const res = await fetch(`${url}?action=get_state&token=${encodeURIComponent(token)}`);
-      const data = await res.json();
-      if (data.error) {
-        dot.className = "dot err";
-        txt.textContent = "خطأ: " + data.error;
-        toggleConnPanel(true);
-        return;
-      }
+      const result = await callServer("getStateForClient", [sessionToken]);
+      const data = result.state;
       dot.className = "dot live";
       txt.textContent = "متصل • " + new Date().toLocaleTimeString();
       lastState = data;
       renderState(data);
-    } catch {
+    } catch (error) {
       dot.className = "dot err";
       txt.textContent = "تعذر الاتصال";
+      if (error.message && error.message.indexOf("انتهت الجلسة") >= 0) {
+        sessionStorage.removeItem("iq_session");
+        sessionToken = "";
+        if (timer) clearInterval(timer);
+        showLogin("انتهت الجلسة؛ سجل الدخول مجددًا.");
+      }
     }
   }
 
   async function sendCommand(cmd) {
-    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
-    if (!url || !token) return toggleConnPanel(true);
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "command", token, ...cmd })
-    });
-    const d = await res.json();
-    if (d.ok) {
-      alert(cmd.test_telegram ? "تم إرسال طلب اختبار التليجرام — ستصل الرسالة للجروب خلال ثوانٍ." : "تم إرسال الأمر إلى المحرك بنجاح.");
-    } else {
-      alert("خطأ: " + (d.error || "غير معروف"));
-    }
+    try {
+      const d = await callServer("sendCommandForClient", [sessionToken, cmd]);
+      if (d.ok) {
+        alert(cmd.test_telegram ? "تم إرسال طلب اختبار التليجرام — ستصل الرسالة للجروب خلال ثوانٍ." : "تم إرسال الأمر إلى المحرك بنجاح.");
+      } else alert("خطأ: " + (d.error || "غير معروف"));
+    } catch (error) { alert("خطأ: " + error.message); }
   }
 
   async function saveTgConfig() {
-    const url = apiUrlEl.value.trim(), token = apiTokenEl.value.trim();
-    if (!url || !token) return toggleConnPanel(true);
     const candles = [...document.querySelectorAll(".tg-candle-cb:checked")].map(el => el.value);
     const tg_config = {
       enabled: document.getElementById("tgEnabled").checked,
@@ -539,13 +571,10 @@
       cooldown_min: Number(document.getElementById("tgCooldownMin").value || 0),
       candles
     };
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=utf-8" },
-      body: JSON.stringify({ action: "save_tg_config", token, tg_config })
-    });
-    const d = await res.json();
-    if (d.ok) alert(`تم حفظ إعدادات التليجرام (${candles.length} شمعة | انتظار ${tg_config.cooldown_min || "تلقائي"} د).`);
+    try {
+      const d = await callServer("saveTelegramConfigForClient", [sessionToken, tg_config]);
+      if (d.ok) alert(`تم حفظ إعدادات التليجرام (${candles.length} شمعة | انتظار ${tg_config.cooldown_min || "تلقائي"} د).`);
+    } catch (error) { alert("خطأ: " + error.message); }
   }
 
   function pctStr(v) {
