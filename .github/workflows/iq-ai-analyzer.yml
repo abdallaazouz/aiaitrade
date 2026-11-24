@@ -1,5 +1,5 @@
 
-name: IQ AI Analyzer 24/7
+name: IQ AI Analyzer Scheduled
 
 on:
   workflow_dispatch:
