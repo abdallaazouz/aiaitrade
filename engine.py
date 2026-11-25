@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import io
 import queue
 import sqlite3
 import threading
@@ -97,6 +98,7 @@ MAX_CANDLES_IN_MEMORY = 40000
 MAX_TIMEFRAME_CANDLES = 1000
 SEQUENCE_LENGTH = 64
 MIN_TIMEFRAME_BARS_FOR_TRAINING = 300
+MIN_DL_TRAINING_ROWS = 600
 RETRAIN_NEW_CANDLES = 60
 MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
@@ -281,7 +283,35 @@ def db_connect():
                             training_rows INTEGER NOT NULL,
                             quality_passed INTEGER NOT NULL,
                             trained_at TEXT NOT NULL,
+                            dl_status TEXT NOT NULL DEFAULT 'pending',
+                            dl_test_balanced_accuracy REAL,
+                            dl_training_rows INTEGER NOT NULL DEFAULT 0,
+                            dl_trained_at TEXT,
+                            dl_error TEXT,
                             PRIMARY KEY(pair, timeframe, step_idx, model_version)
+                        )
+                    """)
+                    training_cols = {
+                        row[1] for row in c.execute("PRAGMA table_info(model_training)").fetchall()
+                    }
+                    for col_name, col_type in [
+                        ("dl_status", "TEXT NOT NULL DEFAULT 'pending'"),
+                        ("dl_test_balanced_accuracy", "REAL"),
+                        ("dl_training_rows", "INTEGER NOT NULL DEFAULT 0"),
+                        ("dl_trained_at", "TEXT"),
+                        ("dl_error", "TEXT"),
+                    ]:
+                        if col_name not in training_cols:
+                            c.execute(
+                                f"ALTER TABLE model_training ADD COLUMN {col_name} {col_type}"
+                            )
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS model_artifacts(
+                            pair TEXT NOT NULL, timeframe INTEGER NOT NULL,
+                            step_idx INTEGER NOT NULL, model_version TEXT NOT NULL,
+                            artifact_name TEXT NOT NULL, payload BLOB NOT NULL,
+                            updated_at TEXT NOT NULL,
+                            PRIMARY KEY(pair, timeframe, step_idx, model_version, artifact_name)
                         )
                     """)
                     c.execute("""
@@ -726,6 +756,113 @@ def compute_sample_weights(df_subset, pair, tf, step):
     w = recency * clarity_w * err_boost
     return w / np.mean(w), mistakes
 
+def update_dl_training_status(pair, tf, step, status, error=None):
+    c = db_connect()
+    c.execute(
+        """
+        UPDATE model_training
+        SET dl_status=?, dl_error=?
+        WHERE pair=? AND timeframe=? AND step_idx=? AND model_version=?
+        """,
+        (status, error[:500] if error else None, pair, tf, step, MODEL_VERSION),
+    )
+    c.commit()
+    c.close()
+
+def save_model_artifact(pair, tf, step, name, payload):
+    c = db_connect()
+    c.execute(
+        """
+        INSERT OR REPLACE INTO model_artifacts(
+            pair, timeframe, step_idx, model_version, artifact_name,
+            payload, updated_at
+        ) VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            pair, tf, step, MODEL_VERSION, name, payload,
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+    c.commit()
+    c.close()
+
+def save_dl_artifacts(pair, tf, step, net, scaler, test_score, training_rows):
+    weights = io.BytesIO()
+    torch.save(net.state_dict(), weights)
+    scaler_data = io.BytesIO()
+    joblib.dump(scaler, scaler_data)
+    trained_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    artifacts = (
+        ("dl_weights", weights.getvalue()),
+        ("dl_scaler", scaler_data.getvalue()),
+    )
+    c = db_connect()
+    with c:
+        for name, payload in artifacts:
+            c.execute(
+                """
+                INSERT OR REPLACE INTO model_artifacts(
+                    pair, timeframe, step_idx, model_version, artifact_name,
+                    payload, updated_at
+                ) VALUES(?,?,?,?,?,?,?)
+                """,
+                (pair, tf, step, MODEL_VERSION, name, payload, trained_at),
+            )
+        c.execute(
+            """
+            UPDATE model_training
+            SET dl_status='trained', dl_test_balanced_accuracy=?,
+                dl_training_rows=?, dl_trained_at=?, dl_error=NULL
+            WHERE pair=? AND timeframe=? AND step_idx=? AND model_version=?
+            """,
+            (
+                float(test_score), int(training_rows), trained_at,
+                pair, tf, step, MODEL_VERSION,
+            ),
+        )
+    c.close()
+
+def load_dl_artifacts(pair, tf, step):
+    c = db_connect()
+    rows = c.execute(
+        """
+        SELECT artifact_name, payload FROM model_artifacts
+        WHERE pair=? AND timeframe=? AND step_idx=? AND model_version=?
+          AND artifact_name IN ('dl_weights', 'dl_scaler')
+        """,
+        (pair, tf, step, MODEL_VERSION),
+    ).fetchall()
+    c.close()
+    artifacts = {name: payload for name, payload in rows}
+    if "dl_weights" not in artifacts or "dl_scaler" not in artifacts:
+        return None
+    return artifacts
+
+def fit_sequence_network(net, x_train, y_train, sample_weights):
+    positive_weight = torch.tensor(
+        [max(float(len(y_train) - y_train.sum()), 1.0) / max(float(y_train.sum()), 1.0)],
+        dtype=torch.float32,
+    )
+    optimizer = torch.optim.AdamW(net.parameters(), lr=0.001, weight_decay=1e-3)
+    net.train()
+    for _ in range(10):
+        order = torch.randperm(len(x_train))
+        for start in range(0, len(order), 128):
+            batch = order[start:start + 128]
+            if len(batch) < 4:
+                continue
+            optimizer.zero_grad()
+            loss = (
+                F.binary_cross_entropy_with_logits(
+                    net(x_train[batch]), y_train[batch],
+                    pos_weight=positive_weight, reduction="none",
+                ) * sample_weights[batch]
+            ).mean()
+            loss.backward()
+            optimizer.step()
+    net.eval()
+    return net
+
 def train_tf_step(raw, pair, tf, step):
     raw_train = closed_timeframe_bars(raw, tf, limit=MAX_CANDLES_IN_MEMORY)
     if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
@@ -846,14 +983,23 @@ def train_tf_step(raw, pair, tf, step):
         )
     brain = FusionGBDTBrain(members, usable=True, quality_passed=has_skill)
     gbdt_models[(pair, tf, step)] = brain
+    serialized_brain = io.BytesIO()
+    joblib.dump(brain, serialized_brain)
+    save_model_artifact(pair, tf, step, "gbdt", serialized_brain.getvalue())
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
     db = db_connect()
     db.execute(
         """
-        INSERT OR REPLACE INTO model_training(
+        INSERT INTO model_training(
             pair, timeframe, step_idx, model_version, source_minute_candles,
             timeframe_candles, training_rows, quality_passed, trained_at
         ) VALUES(?,?,?,?,?,?,?,?,?)
+        ON CONFLICT(pair, timeframe, step_idx, model_version) DO UPDATE SET
+            source_minute_candles=excluded.source_minute_candles,
+            timeframe_candles=excluded.timeframe_candles,
+            training_rows=excluded.training_rows,
+            quality_passed=excluded.quality_passed,
+            trained_at=excluded.trained_at
         """,
         (
             pair, tf, step, MODEL_VERSION, len(completed_minute_candles(raw)),
@@ -864,57 +1010,71 @@ def train_tf_step(raw, pair, tf, step):
     db.commit()
     db.close()
 
-    dl_bal_txt = "off"
-    if TORCH_AVAILABLE and len(d) >= 600:
+    dl_bal_txt = "غير متاح" if not TORCH_AVAILABLE else "بيانات غير كافية"
+    if not TORCH_AVAILABLE:
+        update_dl_training_status(pair, tf, step, "unavailable")
+    elif len(d) < MIN_DL_TRAINING_ROWS:
+        update_dl_training_status(
+            pair, tf, step, "insufficient_data",
+            f"صفوف بعد المؤشرات={len(d)}، المطلوب={MIN_DL_TRAINING_ROWS}",
+        )
+    else:
         try:
-            scaler = StandardScaler().fit(X_tr.to_numpy(dtype=np.float32))
-            scaled_all = scaler.transform(X.to_numpy(dtype=np.float32))
-            all_windows = np.stack([
-                scaled_all[i - SEQUENCE_LENGTH + 1:i + 1]
-                for i in range(SEQUENCE_LENGTH - 1, len(scaled_all))
+            training_scaler = StandardScaler().fit(X_tr.to_numpy(dtype=np.float32))
+            scaled_for_test = training_scaler.transform(X.to_numpy(dtype=np.float32))
+            windows_for_test = np.stack([
+                scaled_for_test[i - SEQUENCE_LENGTH + 1:i + 1]
+                for i in range(SEQUENCE_LENGTH - 1, len(scaled_for_test))
             ])
             sequence_rows = np.arange(SEQUENCE_LENGTH - 1, len(d))
             train_mask = sequence_rows < split
             test_mask = sequence_rows >= test_start
             if train_mask.sum() < 100 or test_mask.sum() < 35:
                 raise ValueError("بيانات التسلسل غير كافية للتدريب والاختبار")
-            xt_tr = torch.from_numpy(all_windows[train_mask].astype(np.float32))
+            xt_tr = torch.from_numpy(windows_for_test[train_mask].astype(np.float32))
             yt_tr = torch.from_numpy(y.to_numpy(dtype=np.float32)[sequence_rows[train_mask]])
             wt_tr = torch.from_numpy(w_all[sequence_rows[train_mask]].astype(np.float32))
-            xt_te = torch.from_numpy(all_windows[test_mask].astype(np.float32))
+            xt_te = torch.from_numpy(windows_for_test[test_mask].astype(np.float32))
             y_te_seq = y.to_numpy(dtype=np.int64)[sequence_rows[test_mask]]
-            pos_w = torch.tensor(
-                [max(float(len(yt_tr) - yt_tr.sum()), 1.0) / max(float(yt_tr.sum()), 1.0)],
-                dtype=torch.float32
-            )
             torch.manual_seed(42)
-            net = DeepCandleSequenceNet(len(FEATURES))
-            opt = torch.optim.AdamW(net.parameters(), lr=0.001, weight_decay=1e-3)
-            net.train()
-            for _ in range(10):
-                order = torch.randperm(len(xt_tr))
-                for i0 in range(0, len(order), 128):
-                    idx = order[i0:i0 + 128]
-                    if len(idx) < 4:
-                        continue
-                    opt.zero_grad()
-                    loss = (
-                        F.binary_cross_entropy_with_logits(
-                            net(xt_tr[idx]), yt_tr[idx], pos_weight=pos_w, reduction="none"
-                        ) * wt_tr[idx]
-                    ).mean()
-                    loss.backward()
-                    opt.step()
-            net.eval()
+            validation_net = fit_sequence_network(
+                DeepCandleSequenceNet(len(FEATURES)), xt_tr, yt_tr, wt_tr
+            )
             with torch.no_grad():
-                p_dl = torch.sigmoid(net(xt_te)).numpy()
+                p_dl = torch.sigmoid(validation_net(xt_te)).numpy()
             dl_bal = balanced_accuracy_score(y_te_seq, (p_dl >= 0.5).astype(int))
             dl_bal_txt = f"{dl_bal:.3f}"
-            if dl_bal > 0.505:
-                dl_models[(pair, tf, step)] = (net, scaler, dl_bal)
-                torch.save(net.state_dict(), MODEL_DIR / f"{pair}_{tf}m_c{step}_dl.pt")
-                joblib.dump(scaler, MODEL_DIR / f"{pair}_{tf}m_c{step}_dl_scaler.joblib")
+
+            # Keep the chronological test untouched, then train the deployed model
+            # on every valid sequence available for this pair/timeframe/target.
+            deployment_scaler = StandardScaler().fit(X.to_numpy(dtype=np.float32))
+            scaled_all = deployment_scaler.transform(X.to_numpy(dtype=np.float32))
+            all_windows = np.stack([
+                scaled_all[i - SEQUENCE_LENGTH + 1:i + 1]
+                for i in range(SEQUENCE_LENGTH - 1, len(scaled_all))
+            ])
+            all_rows = np.arange(SEQUENCE_LENGTH - 1, len(d))
+            xt_all = torch.from_numpy(all_windows.astype(np.float32))
+            yt_all = torch.from_numpy(y.to_numpy(dtype=np.float32)[all_rows])
+            wt_all = torch.from_numpy(w_all[all_rows].astype(np.float32))
+            torch.manual_seed(42)
+            deployment_net = fit_sequence_network(
+                DeepCandleSequenceNet(len(FEATURES)), xt_all, yt_all, wt_all
+            )
+            dl_models[(pair, tf, step)] = (deployment_net, deployment_scaler, dl_bal)
+            save_dl_artifacts(
+                pair, tf, step, deployment_net, deployment_scaler,
+                dl_bal, len(all_rows),
+            )
+            add_log(
+                f"✅ تم تدريب GRU على كامل التاريخ: {tf}د ش{step} | "
+                f"التسلسلات={len(all_rows)} | BA اختبار={dl_bal:.3f}"
+            )
         except Exception as exc:
+            dl_bal_txt = f"خطأ: {type(exc).__name__}"
+            update_dl_training_status(
+                pair, tf, step, "error", f"{type(exc).__name__}: {exc}",
+            )
             add_log(f"⚠️ تعذر تدريب الشبكة العميقة ({tf}د ش{step}): {exc}")
 
     last_train_ts[(pair, tf, step)] = int(raw["ts"].iloc[-1])
@@ -929,9 +1089,31 @@ def _load_gbdt(pair, tf, step):
     if k in gbdt_models:
         return gbdt_models[k]
     p = MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib"
+    try:
+        c = db_connect()
+        row = c.execute(
+            """
+            SELECT payload, updated_at FROM model_artifacts
+            WHERE pair=? AND timeframe=? AND step_idx=? AND model_version=?
+              AND artifact_name='gbdt'
+            """,
+            (pair, tf, step, MODEL_VERSION),
+        ).fetchone()
+        c.close()
+        if row:
+            gbdt_models[k] = joblib.load(io.BytesIO(row[0]))
+            last_train_ts.setdefault(
+                k, int(datetime.fromisoformat(row[1]).timestamp())
+            )
+            return gbdt_models[k]
+    except Exception as exc:
+        add_log(f"تعذر تحميل GBDT من SQLite ({tf}د ش{step}): {type(exc).__name__}: {exc}")
     if p.exists():
         try:
             gbdt_models[k] = joblib.load(p)
+            serialized_brain = io.BytesIO()
+            joblib.dump(gbdt_models[k], serialized_brain)
+            save_model_artifact(pair, tf, step, "gbdt", serialized_brain.getvalue())
             last_train_ts.setdefault(k, int(p.stat().st_mtime))
             return gbdt_models[k]
         except Exception as exc:
@@ -944,6 +1126,33 @@ def _load_dl(pair, tf, step):
         return dl_models[k]
     if not TORCH_AVAILABLE:
         return None
+    try:
+        artifacts = load_dl_artifacts(pair, tf, step)
+        if artifacts is not None:
+            scaler = joblib.load(io.BytesIO(artifacts["dl_scaler"]))
+            net = DeepCandleSequenceNet(len(FEATURES))
+            state = torch.load(
+                io.BytesIO(artifacts["dl_weights"]),
+                map_location="cpu",
+                weights_only=True,
+            )
+            net.load_state_dict(state)
+            net.eval()
+            c = db_connect()
+            row = c.execute(
+                """
+                SELECT dl_test_balanced_accuracy FROM model_training
+                WHERE pair=? AND timeframe=? AND step_idx=? AND model_version=?
+                """,
+                (pair, tf, step, MODEL_VERSION),
+            ).fetchone()
+            c.close()
+            score = float(row[0]) if row and row[0] is not None else 0.5
+            dl_models[k] = (net, scaler, score)
+            return dl_models[k]
+    except Exception as exc:
+        add_log(f"تعذر تحميل نموذج GRU من SQLite ({tf}د ش{step}): {type(exc).__name__}: {exc}")
+
     mp, sp = MODEL_DIR / f"{pair}_{tf}m_c{step}_dl.pt", MODEL_DIR / f"{pair}_{tf}m_c{step}_dl_scaler.joblib"
     if mp.exists() and sp.exists():
         try:
@@ -962,7 +1171,8 @@ def get_training_summary(pair):
     rows = c.execute(
         """
         SELECT timeframe, step_idx, source_minute_candles, timeframe_candles,
-               training_rows, quality_passed
+               training_rows, quality_passed, dl_status,
+               dl_test_balanced_accuracy, dl_training_rows, dl_error
         FROM model_training
         WHERE pair=? AND model_version=?
         """,
@@ -975,8 +1185,15 @@ def get_training_summary(pair):
             "timeframe_candles": int(bars),
             "training_rows": int(samples),
             "quality_passed": bool(quality),
+            "dl_status": dl_status,
+            "dl_test_balanced_accuracy": (
+                float(dl_score) if dl_score is not None else None
+            ),
+            "dl_training_rows": int(dl_rows),
+            "dl_error": dl_error,
         }
-        for tf, step, minutes, bars, samples, quality in rows
+        for tf, step, minutes, bars, samples, quality, dl_status,
+            dl_score, dl_rows, dl_error in rows
     }
 
 def get_adaptive_engine_weights(pair, tf, step):
@@ -1047,6 +1264,7 @@ def build_forecast(raw, pair):
                 )
             dl_obj = _load_dl(pair, tf, step)
             dl_p = None
+            training = training_summary.get(f"{tf}_{step}")
             dl_status = "غير مدرب"
             if dl_obj is not None:
                 net, scaler, _ = dl_obj
@@ -1054,7 +1272,21 @@ def build_forecast(raw, pair):
                 seq = scaler.transform(seq).reshape(1, SEQUENCE_LENGTH, len(FEATURES))
                 with torch.no_grad():
                     dl_p = float(torch.sigmoid(net(torch.from_numpy(seq))).item())
-                dl_status = "مدرب ومشارك"
+                if training and training["dl_test_balanced_accuracy"] is not None:
+                    dl_status = (
+                        "مدرب ومشارك؛ BA الاختبار "
+                        f"{training['dl_test_balanced_accuracy']:.3f}"
+                    )
+                else:
+                    dl_status = "مدرب ومشارك؛ لا توجد نتيجة اختبار محفوظة"
+            elif training:
+                dl_status = {
+                    "pending": "بانتظار تدريب التعلم العميق",
+                    "insufficient_data": "بيانات غير كافية للتعلم العميق",
+                    "unavailable": "PyTorch غير متاح",
+                    "error": "تعذر تدريب التعلم العميق؛ راجع السجل",
+                    "trained": "النموذج محفوظ لكن تعذر تحميله",
+                }.get(training["dl_status"], "غير مدرب")
             stat_p = stat_probs[step]
             kr_p = kronos_map.get((tf, step))
 
@@ -1077,7 +1309,7 @@ def build_forecast(raw, pair):
                 "stat_prob": stat_p, "gbdt_prob": gbdt_p,
                 "dl_prob": dl_p, "kronos_prob": kr_p,
                 "gbdt_status": gbdt_status, "dl_status": dl_status,
-                "training": training_summary.get(f"{tf}_{step}"),
+                "training": training,
                 "feature_ts": int(bars["ts"].iloc[-1]),
                 "feature_price": float(bars["close"].iloc[-1]),
             }
@@ -1404,6 +1636,7 @@ def enqueue_training(raw, pair, force=False):
 
     latest_ts = int(raw["ts"].iloc[-1])
     added = 0
+    training_summary = get_training_summary(pair) if TORCH_AVAILABLE else {}
 
     for tf in TIMEFRAMES:
         tf_bar_count = len(closed_timeframe_bars(
@@ -1413,6 +1646,16 @@ def enqueue_training(raw, pair, force=False):
             continue
         for step in STEPS:
             k = (pair, tf, step)
+            training_record = training_summary.get(f"{tf}_{step}")
+            dl_needs_training = (
+                TORCH_AVAILABLE
+                and tf_bar_count >= MIN_DL_TRAINING_ROWS
+                and (
+                    not training_record
+                    or training_record["dl_status"] != "trained"
+                    or _load_dl(pair, tf, step) is None
+                )
+            )
 
             with training_lock:
                 if k in training_jobs:
@@ -1426,7 +1669,7 @@ def enqueue_training(raw, pair, force=False):
                     last_train_ts[k] = previous_ts
                 new_data = previous_ts is None or latest_ts - previous_ts >= RETRAIN_NEW_CANDLES * INTERVAL
 
-                if not (force or new_data):
+                if not (force or new_data or dl_needs_training):
                     continue
 
                 training_jobs.add(k)
@@ -1594,10 +1837,20 @@ if __name__ == "__main__":
 
             stop_event.wait(15)
     finally:
-        push_to_cloud(
-            read_candles(c, current_pair), current_pair, None, 0,
-            "توقفت هذه الجلسة حسب حد GitHub Actions؛ بانتظار التشغيل المجدول التالي"
-        )
-        stop_event.set()
         train_queue.put(None)
+        train_queue.join()
+        stop_event.set()
+        final_raw = read_candles(c, current_pair)
+        if len(final_raw) >= 150:
+            try:
+                latest_forecast = build_forecast(final_raw, current_pair)
+            except Exception as exc:
+                add_log(
+                    f"تعذر تحديث التوقع بعد اكتمال التدريب: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        push_to_cloud(
+            final_raw, current_pair, None, 0,
+            "تم حفظ التدريب والبيانات؛ بانتظار التشغيل التالي"
+        )
         c.close()
