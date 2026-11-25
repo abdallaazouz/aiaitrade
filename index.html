@@ -667,8 +667,19 @@
           const accTxt = accObj && accObj.settled ? `دقة ${accObj.hit_rate.toFixed(0)}% (${accObj.hits}/${accObj.settled})` : "قيد التقييم";
           const training = c.training || (fc.training_summary || {})[`${tf}_${c.step}`];
           const trainingTxt = training
-            ? `تدريب GBDT: ${training.training_rows.toLocaleString()} صف من ${training.timeframe_candles.toLocaleString()} شمعة فريم • ${training.minute_candles.toLocaleString()} شمعة دقيقة`
-            : "بانتظار اكتمال تدريب GBDT";
+            ? `GBDT: ${training.training_rows.toLocaleString()} صف / ${training.timeframe_candles.toLocaleString()} شمعة فريم من ${training.minute_candles.toLocaleString()} شمعة دقيقة`
+            : "GBDT: بانتظار التدريب";
+          const dlScore = training && training.dl_test_balanced_accuracy;
+          const dlStatusLabel = {
+            pending: "بانتظار التدريب",
+            insufficient_data: "بيانات غير كافية",
+            unavailable: "PyTorch غير متاح",
+            error: "تعذر التدريب؛ راجع سجل المحرك",
+            trained: "مدرب",
+          };
+          const dlTrainingTxt = training && training.dl_status === "trained"
+            ? `GRU: ${training.dl_training_rows.toLocaleString()} تسلسل • BA اختبار ${dlScore === null ? "—" : (dlScore * 100).toFixed(1) + "%"}`
+            : `GRU: ${dlStatusLabel[(training && training.dl_status) || "pending"] || "بانتظار التدريب"}`;
           return `
             <div class="candle-box ${bCls}">
               <div class="candle-top">
@@ -680,7 +691,8 @@
                 <span class="exp-chip" title="${c.gbdt_status || "غير مدرب"}">GBDT ${c.gbdt_prob === null || c.gbdt_prob === undefined ? (c.gbdt_status || "غير مدرب") : pctStr(c.gbdt_prob)}</span>
                 <span class="exp-chip" title="${c.dl_status || "غير مدرب"}">عميق ${c.dl_prob === null || c.dl_prob === undefined ? (c.dl_status || "غير مدرب") : pctStr(c.dl_prob)}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
-                <span class="exp-chip" title="${c.gbdt_status || "غير مدرب"}">${trainingTxt}</span>
+                <span class="exp-chip" title="معلومات التدريب">${trainingTxt}</span>
+                <span class="exp-chip" title="${c.dl_status || "غير مدرب"}">${dlTrainingTxt}</span>
               </div>
             </div>`;
         }).join("");
