@@ -387,7 +387,7 @@
 </div>
 
 <script>
-  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx1RH6TN26_FWwNohG4pBwGkiQxly0_rGHd7aU3Hpbsn5Xj-sk6llJY5NXqAnyWWGROAg/exec";
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxaw2UcKmHOFz-0N8Kw_Hx_3V5v2Dmfc2C2YLM8ilC39HECzfU_zSTGYjNACQ7TYiaDHg/exec";
   const TIMEFRAME_GROUPS = [
     { tf: 5,  title: "⏱️ فريم 5 دقائق",  items: [["5_1","شمعة 1 (+5د)"],["5_2","شمعة 2 (+10د)"],["5_3","شمعة 3 (+15د)"]] },
     { tf: 10, title: "⏱️ فريم 10 دقائق", items: [["10_1","شمعة 1 (+10د)"],["10_2","شمعة 2 (+20د)"],["10_3","شمعة 3 (+30د)"]] },
@@ -643,9 +643,8 @@
       const cls = fc.direction === "صعود" ? "up" : (fc.direction === "هبوط" ? "down" : "neutral");
       hero.className = "hero-banner " + cls;
       const tfCount = Object.keys(fc.timeframe_summary || {}).length;
-      const trainingCandles = Number(fc.training_candles || 0).toLocaleString();
       document.getElementById("marketMeta").textContent =
-        `${fc.pair} • 12 هدفًا للتوقع • كل نموذج يستخدم حتى ${trainingCandles} شمعة تدريب`;
+        "أعداد بيانات تدريب GBDT الفعلية محفوظة وتظهر لكل هدف.";
       document.getElementById("heroDirText").textContent =
         `اتجاه السوق: ${fc.direction} — الثقة ${Math.round(fc.dir_confidence * 100)}%`;
       const d = fc.duration || {};
@@ -666,6 +665,10 @@
           const confPct = Math.round(c.conf * 100);
           const accObj = byTfStep[`${tf}_${c.step}`];
           const accTxt = accObj && accObj.settled ? `دقة ${accObj.hit_rate.toFixed(0)}% (${accObj.hits}/${accObj.settled})` : "قيد التقييم";
+          const training = c.training || (fc.training_summary || {})[`${tf}_${c.step}`];
+          const trainingTxt = training
+            ? `تدريب GBDT: ${training.training_rows.toLocaleString()} صف من ${training.timeframe_candles.toLocaleString()} شمعة فريم • ${training.minute_candles.toLocaleString()} شمعة دقيقة`
+            : "بانتظار اكتمال تدريب GBDT";
           return `
             <div class="candle-box ${bCls}">
               <div class="candle-top">
@@ -677,6 +680,7 @@
                 <span class="exp-chip" title="${c.gbdt_status || "غير مدرب"}">GBDT ${c.gbdt_prob === null || c.gbdt_prob === undefined ? (c.gbdt_status || "غير مدرب") : pctStr(c.gbdt_prob)}</span>
                 <span class="exp-chip" title="${c.dl_status || "غير مدرب"}">عميق ${c.dl_prob === null || c.dl_prob === undefined ? (c.dl_status || "غير مدرب") : pctStr(c.dl_prob)}</span>
                 <span class="exp-chip" style="margin-right:auto;color:#93c5fd;">${accTxt}</span>
+                <span class="exp-chip" title="${c.gbdt_status || "غير مدرب"}">${trainingTxt}</span>
               </div>
             </div>`;
         }).join("");
