@@ -7,7 +7,8 @@ import queue
 import sqlite3
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from collections import deque
 
 import numpy as np
@@ -80,11 +81,15 @@ APPS_SCRIPT_URL = os.environ.get("APPS_SCRIPT_URL", "").strip()
 SECRET_TOKEN = os.environ.get("SECRET_TOKEN", "").strip()
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "").strip()
-MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "17100"))
+MAX_RUNTIME_SEC = int(os.environ.get("MAX_RUNTIME_SEC", "16200"))
 ENABLE_KRONOS = os.environ.get("ENABLE_KRONOS", "1") == "1"
 
-DEFAULT_PAIR = os.environ.get("DEFAULT_PAIR", "EURUSD")
-AUTO_OTC_ON_CLOSED_MARKET = True
+CAIRO_TZ = ZoneInfo("Africa/Cairo")
+FOREX_PAIRS = frozenset({
+    "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD",
+    "AUDUSD", "NZDUSD", "EURJPY", "EURGBP", "GBPJPY",
+})
+DEFAULT_PAIR = os.environ.get("DEFAULT_PAIR", "EURUSD").strip().upper()
 
 DATA_DIR = Path("data")
 MODEL_VERSION = "v9-full-history"
@@ -179,13 +184,13 @@ logs_buffer = deque(maxlen=40)
 pending_sheet_preds = []
 state_lock = threading.Lock()
 latest_forecast = {"ok": False, "note": "جاري تهيئة النظام..."}
-current_pair = DEFAULT_PAIR
+current_pair = DEFAULT_PAIR if DEFAULT_PAIR in FOREX_PAIRS else "EURUSD"
 
 kronos_predictor = None
 kronos_cache = {}  # (pair, last_ts) -> {(tf, step): prob}
 
 def add_log(msg):
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+    line = f"[{datetime.now(CAIRO_TZ).strftime('%H:%M:%S')}] {msg}"
     try:
         print(line, flush=True)
     except UnicodeEncodeError:
@@ -631,8 +636,9 @@ def indicators(raw: pd.DataFrame) -> pd.DataFrame:
     d["bullish_engulfing"] = (prev_bear & bull & (op <= close.shift(1)) & (close >= op.shift(1))).astype(int)
     d["bearish_engulfing"] = (prev_bull & bear & (op >= close.shift(1)) & (close <= op.shift(1))).astype(int)
 
-    hour = d["time"].dt.hour
-    weekday = d["time"].dt.day_of_week
+    cairo_time = d["time"].dt.tz_convert(CAIRO_TZ)
+    hour = cairo_time.dt.hour
+    weekday = cairo_time.dt.day_of_week
 
     d["hour_sin"] = np.sin(2 * np.pi * hour / 24)
     d["hour_cos"] = np.cos(2 * np.pi * hour / 24)
@@ -780,7 +786,7 @@ def save_model_artifact(pair, tf, step, name, payload):
         """,
         (
             pair, tf, step, MODEL_VERSION, name, payload,
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            datetime.now(CAIRO_TZ).isoformat(timespec="seconds"),
         ),
     )
     c.commit()
@@ -791,7 +797,7 @@ def save_dl_artifacts(pair, tf, step, net, scaler, test_score, training_rows):
     torch.save(net.state_dict(), weights)
     scaler_data = io.BytesIO()
     joblib.dump(scaler, scaler_data)
-    trained_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    trained_at = datetime.now(CAIRO_TZ).isoformat(timespec="seconds")
     artifacts = (
         ("dl_weights", weights.getvalue()),
         ("dl_scaler", scaler_data.getvalue()),
@@ -1004,7 +1010,7 @@ def train_tf_step(raw, pair, tf, step):
         (
             pair, tf, step, MODEL_VERSION, len(completed_minute_candles(raw)),
             len(raw_train), len(X), int(has_skill),
-            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            datetime.now(CAIRO_TZ).isoformat(timespec="seconds"),
         ),
     )
     db.commit()
@@ -1352,8 +1358,8 @@ def build_forecast(raw, pair):
         "all_items": all_items,
         "candles_per_timeframe": MAX_TIMEFRAME_CANDLES,
         "training_summary": training_summary,
-        "updated_at": datetime.now().strftime("%H:%M:%S"),
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "updated_at": datetime.now(CAIRO_TZ).strftime("%H:%M:%S"),
+        "created_at": datetime.now(CAIRO_TZ).isoformat(timespec="seconds"),
     }
 
 def send_telegram_message(text):
@@ -1368,9 +1374,9 @@ def test_telegram_connection():
     global tg_last_info
     try:
         send_telegram_message(
-            f"✅ اختبار الاتصال ناجح (GitHub Actions)\nالعملة: {current_pair}\nالوقت: {datetime.now().strftime('%H:%M:%S')}"
+            f"✅ اختبار الاتصال ناجح (GitHub Actions)\nالعملة: {current_pair}\nالوقت: {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
         )
-        tg_last_info = f"نجح الاختبار الساعة {datetime.now().strftime('%H:%M:%S')}"
+        tg_last_info = f"نجح الاختبار الساعة {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
         add_log("📩 تم إرسال رسالة اختبار التليجرام.")
     except Exception as exc:
         tg_last_info = f"فشل الاختبار: {exc}"
@@ -1443,7 +1449,7 @@ def maybe_send_telegram(fc, raw):
     try:
         send_telegram_message(msg)
         tg_cooldown_until[pair] = now + wait_min * 60
-        until_str = datetime.fromtimestamp(tg_cooldown_until[pair]).strftime("%H:%M:%S")
+        until_str = datetime.fromtimestamp(tg_cooldown_until[pair], CAIRO_TZ).strftime("%H:%M:%S")
         tg_last_info = f"✅ أُرسل {common_dir} ({pair}) | انتظار {wait_min}د حتى {until_str}"
         add_log(f"📩 إشعار تليجرام: {pair} | {common_dir} | انتظار={wait_min}د")
     except Exception as exc:
@@ -1530,7 +1536,7 @@ def settle_pending_predictions(raw, pair):
             continue
         actual_up = 1 if p_end > p_start else 0
         hit = 1 if actual_up == (1 if (p_up or 0) >= 0.5 else 0) else 0
-        settled_at = datetime.now().isoformat(timespec="seconds")
+        settled_at = datetime.now(CAIRO_TZ).isoformat(timespec="seconds")
         c.execute(
             "UPDATE predictions SET status='SETTLED', start_price=?, actual_price=?, actual_up=?, hit=?, settled_at=? WHERE id=?",
             (p_start, p_end, actual_up, hit, settled_at, pid)
@@ -1574,6 +1580,8 @@ def prediction_stats(pair):
             by_tf_step[f"{tf}_{step}"] = {"settled": sc, "hits": hc, "hit_rate": (100.0 * hc / sc) if sc else None}
     by_pair = []
     for p, cnt, hits in c.execute("SELECT pair, COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE status='SETTLED' GROUP BY pair ORDER BY COUNT(*) DESC").fetchall():
+        if p not in FOREX_PAIRS:
+            continue
         cnt, hits = int(cnt or 0), int(hits or 0)
         by_pair.append({"pair": p, "settled": cnt, "hits": hits, "hit_rate": (100.0 * hits / cnt) if cnt else None})
     c.close()
@@ -1699,7 +1707,7 @@ def push_to_cloud(raw, pair, max_ts, gaps, status_text):
         "state": {
             "ok": True, "engine_status": status_text, "pair": pair,
             "candle_count": int(len(raw)) if raw is not None else 0,
-            "last_candle_str": datetime.fromtimestamp(max_ts).strftime("%Y-%m-%d %H:%M:%S") if max_ts else "—",
+            "last_candle_str": datetime.fromtimestamp(max_ts, CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S") if max_ts else "—",
             "gaps": gaps, "forecast": fc_send, "stats": prediction_stats(pair),
             "tg_status": {"info": tg_last_info, "cooldown_sec": cd_left},
             "candles_tail": tail, "logs": logs,
@@ -1732,6 +1740,12 @@ def poll_cloud_command():
         add_log(f"تعذر استطلاع أمر السحابة: {exc}")
         return None
 
+def stop_workflow_continuation():
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if output_path:
+        with open(output_path, "a", encoding="utf-8") as output:
+            output.write("continue=false\n")
+
 if __name__ == "__main__":
     missing_secrets = [
         name for name, value in {
@@ -1743,6 +1757,9 @@ if __name__ == "__main__":
     ]
     if missing_secrets:
         raise SystemExit(f"إعدادات GitHub Secrets المطلوبة غير موجودة: {', '.join(missing_secrets)}")
+
+    if DEFAULT_PAIR not in FOREX_PAIRS:
+        add_log(f"الزوج الافتراضي {DEFAULT_PAIR} غير مدعوم؛ سيستخدم EURUSD.")
 
     start_ts = time.time()
     threading.Thread(target=train_loop, daemon=True).start()
@@ -1768,15 +1785,30 @@ if __name__ == "__main__":
             if cmd:
                 if cmd.get("stop"):
                     add_log("أمر إيقاف من الويب.")
+                    stop_workflow_continuation()
                     break
                 if cmd.get("test_telegram"):
                     test_telegram_connection()
-                if cmd.get("pair") and cmd["pair"] != current_pair:
-                    current_pair = cmd["pair"].strip().upper()
-                    add_log(f"تغيير الزوج إلى: {current_pair}")
+                requested_pair = cmd.get("pair")
+                if requested_pair:
+                    if not isinstance(requested_pair, str) or requested_pair.strip().upper() not in FOREX_PAIRS:
+                        add_log(f"رُفض تغيير العملة إلى زوج غير مدعوم: {requested_pair}")
+                    elif requested_pair.strip().upper() != current_pair:
+                        current_pair = requested_pair.strip().upper()
+                        add_log(f"تغيير الزوج إلى: {current_pair}")
                 if cmd.get("train_now"):
                     raw = read_candles(c, current_pair)
                     enqueue_training(raw, current_pair, force=True)
+
+            if datetime.now(CAIRO_TZ).weekday() in (5, 6):
+                market_closed_note = "سوق الفوركس مغلق السبت والأحد بتوقيت القاهرة"
+                latest_forecast = {"ok": False, "note": market_closed_note}
+                push_to_cloud(
+                    read_candles(c, current_pair), current_pair, None, 0,
+                    market_closed_note
+                )
+                stop_event.wait(60)
+                continue
 
             try:
                 if api is None or not api.check_connect():
@@ -1793,14 +1825,6 @@ if __name__ == "__main__":
                     add_log("✅ اتصال ناجح بـ IQ Option.")
 
                     load_initial_history(api, c, current_pair)
-                    if AUTO_OTC_ON_CLOSED_MARKET and not current_pair.endswith("-OTC"):
-                        recent = c.execute(
-                            "SELECT MAX(ts) FROM candles WHERE pair=?", (current_pair,)
-                        ).fetchone()[0]
-                        if recent is None or (int(time.time()) - int(recent) > 600):
-                            current_pair = current_pair + "-OTC"
-                            add_log(f"تحويل تلقائي للعطلة إلى {current_pair}")
-                            load_initial_history(api, c, current_pair)
                     raw = read_candles(c, current_pair)
                     enqueue_training(raw, current_pair)
 
