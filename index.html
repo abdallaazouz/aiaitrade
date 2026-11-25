@@ -89,7 +89,6 @@
     button:hover { transform: translateY(-1px); filter: brightness(1.08); }
     button:active { transform: translateY(0); }
     button.secondary { background: #182338; border-color: #2b3c5e; }
-    button.otc { background: linear-gradient(135deg, #6d28d9, #8b5cf6); }
     button.tg { background: linear-gradient(135deg, #0284c7, #06b6d4); }
     button.danger { background: linear-gradient(135deg, #991b1b, #dc2626); }
     button.sm { padding: 6px 10px; font-size: 0.8rem; border-radius: 8px; }
@@ -305,19 +304,13 @@
         <div class="row">
           <span class="muted">العملة:</span>
           <select id="pairSelect">
-            <optgroup label="السوق العادي (أيام العمل)">
+            <optgroup label="سوق الفوركس (أيام العمل)">
               <option>EURUSD</option><option>GBPUSD</option><option>USDJPY</option>
               <option>USDCHF</option><option>USDCAD</option><option>AUDUSD</option>
               <option>NZDUSD</option><option>EURJPY</option><option>EURGBP</option><option>GBPJPY</option>
             </optgroup>
-            <optgroup label="نظام OTC (العطلات)">
-              <option>EURUSD-OTC</option><option>GBPUSD-OTC</option><option>USDJPY-OTC</option>
-              <option>USDCHF-OTC</option><option>USDCAD-OTC</option><option>AUDUSD-OTC</option>
-              <option>NZDUSD-OTC</option><option>EURJPY-OTC</option><option>EURGBP-OTC</option><option>GBPJPY-OTC</option>
-            </optgroup>
           </select>
           <button class="secondary" onclick="sendCommand({pair: pairSelect.value})">تطبيق</button>
-          <button class="otc" onclick="toggleOtcPair()">🔄 تبديل OTC / عادي</button>
           <button onclick="sendCommand({train_now: true})">⚡ تدريب وتصحيح الـ 12 نموذج</button>
           <button class="danger" onclick="sendCommand({stop: true})">⏹ إيقاف</button>
         </div>
@@ -387,7 +380,7 @@
 </div>
 
 <script>
-  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbx1RH6TN26_FWwNohG4pBwGkiQxly0_rGHd7aU3Hpbsn5Xj-sk6llJY5NXqAnyWWGROAg/exec";
+  const APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxaw2UcKmHOFz-0N8Kw_Hx_3V5v2Dmfc2C2YLM8ilC39HECzfU_zSTGYjNACQ7TYiaDHg/exec";
   const TIMEFRAME_GROUPS = [
     { tf: 5,  title: "⏱️ فريم 5 دقائق",  items: [["5_1","شمعة 1 (+5د)"],["5_2","شمعة 2 (+10د)"],["5_3","شمعة 3 (+15د)"]] },
     { tf: 10, title: "⏱️ فريم 10 دقائق", items: [["10_1","شمعة 1 (+10د)"],["10_2","شمعة 2 (+20د)"],["10_3","شمعة 3 (+30د)"]] },
@@ -524,13 +517,6 @@
     document.querySelectorAll(".tg-candle-cb").forEach(cb => cb.checked = checked);
   }
 
-  function toggleOtcPair() {
-    let p = pairSelect.value;
-    p = p.endsWith("-OTC") ? p.replace("-OTC", "") : (p + "-OTC");
-    pairSelect.value = p;
-    sendCommand({ pair: p });
-  }
-
   function unlockAndTestBeep() {
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
     if (audioCtx.state === "suspended") audioCtx.resume();
@@ -559,7 +545,7 @@
       const result = await callServer("getStateForClient", [sessionToken]);
       const data = result.state;
       dot.className = "dot live";
-      txt.textContent = "متصل • " + new Date().toLocaleTimeString();
+      txt.textContent = "متصل • " + new Date().toLocaleTimeString("ar-EG", { timeZone: "Africa/Cairo" }) + " بتوقيت القاهرة";
       lastState = data;
       renderState(data);
     } catch (error) {
