@@ -8,7 +8,7 @@ on:
 
 concurrency:
   group: iq-ai-analyzer-runner
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -43,7 +43,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p data/models_v8
+          mkdir -p data/models_v9
 
           if gh release view state-backup >/dev/null 2>&1; then
             gh release download state-backup \
@@ -77,7 +77,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p data/models_v8
+          mkdir -p data/models_v9
           tar -czf backup.tar.gz -C data .
 
           if ! gh release view state-backup >/dev/null 2>&1; then
