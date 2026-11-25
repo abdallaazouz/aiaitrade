@@ -1,0 +1,18 @@
+[Unit]
+Description=IQ AI Analyzer trading engine
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=iqai
+Group=iqai
+WorkingDirectory=/opt/iq-ai-analyzer
+EnvironmentFile=/etc/iq-ai-analyzer.env
+ExecStart=/opt/iq-ai-analyzer/.venv/bin/python -u /opt/iq-ai-analyzer/engine.py
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
