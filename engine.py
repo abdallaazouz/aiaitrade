@@ -86,8 +86,8 @@ DEFAULT_PAIR = os.environ.get("DEFAULT_PAIR", "EURUSD")
 AUTO_OTC_ON_CLOSED_MARKET = True
 
 DATA_DIR = Path("data")
-MODEL_VERSION = "v8-mtf-sequence"
-MODEL_DIR = DATA_DIR / "models_v8"
+MODEL_VERSION = "v9-full-history"
+MODEL_DIR = DATA_DIR / "models_v9"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 LOCAL_DB = DATA_DIR / "iq_ai_data.sqlite3"
@@ -95,10 +95,9 @@ LOCAL_DB = DATA_DIR / "iq_ai_data.sqlite3"
 INTERVAL = 60
 MAX_CANDLES_IN_MEMORY = 40000
 MAX_TIMEFRAME_CANDLES = 1000
-TRAINING_MINUTE_CANDLES = 10000
 SEQUENCE_LENGTH = 64
 MIN_TIMEFRAME_BARS_FOR_TRAINING = 300
-RETRAIN_NEW_CANDLES = 600
+RETRAIN_NEW_CANDLES = 60
 MIN_CANDLES_FOR_TRAINING = 650
 TIMEFRAMES = (5, 10, 15, 30)
 INITIAL_HISTORY_CANDLES = MAX_TIMEFRAME_CANDLES * max(TIMEFRAMES)
@@ -125,9 +124,10 @@ FEATURES = [
 ]
 
 class FusionGBDTBrain:
-    def __init__(self, gbdt_members, usable=True):
+    def __init__(self, gbdt_members, usable=True, quality_passed=True):
         self.gbdt_members = gbdt_members
         self.usable = usable
+        self.quality_passed = quality_passed
 
     def predict_gbdt(self, X):
         if not self.usable:
@@ -270,6 +270,18 @@ def db_connect():
                             pair TEXT NOT NULL, ts INTEGER NOT NULL,
                             open REAL, high REAL, low REAL, close REAL, volume REAL,
                             PRIMARY KEY(pair, ts)
+                        )
+                    """)
+                    c.execute("""
+                        CREATE TABLE IF NOT EXISTS model_training(
+                            pair TEXT NOT NULL, timeframe INTEGER NOT NULL,
+                            step_idx INTEGER NOT NULL, model_version TEXT NOT NULL,
+                            source_minute_candles INTEGER NOT NULL,
+                            timeframe_candles INTEGER NOT NULL,
+                            training_rows INTEGER NOT NULL,
+                            quality_passed INTEGER NOT NULL,
+                            trained_at TEXT NOT NULL,
+                            PRIMARY KEY(pair, timeframe, step_idx, model_version)
                         )
                     """)
                     c.execute("""
@@ -715,7 +727,7 @@ def compute_sample_weights(df_subset, pair, tf, step):
     return w / np.mean(w), mistakes
 
 def train_tf_step(raw, pair, tf, step):
-    raw_train = closed_timeframe_bars(raw, tf, limit=MAX_TIMEFRAME_CANDLES)
+    raw_train = closed_timeframe_bars(raw, tf, limit=MAX_CANDLES_IN_MEMORY)
     if len(raw_train) < MIN_TIMEFRAME_BARS_FOR_TRAINING:
         return f"بيانات غير كافية للفريم {tf}د: {len(raw_train)}/{MIN_TIMEFRAME_BARS_FOR_TRAINING} شمعة مكتملة."
     d = indicators(raw_train)
@@ -824,7 +836,7 @@ def train_tf_step(raw, pair, tf, step):
         add_log(
             f"ℹ️ GBDT لم يتجاوز الاختبار الزمني النهائي "
             f"(BA={test_bal:.3f} | Brier={test_brier:.4f} | "
-            f"الأساس={test_baseline_brier:.4f})؛ لن يشارك في الإجماع."
+            f"الأساس={test_baseline_brier:.4f})؛ سيشارك في التوقع مع إظهار التحفظ."
         )
     else:
         add_log(
@@ -832,9 +844,25 @@ def train_tf_step(raw, pair, tf, step):
             f"(BA={test_bal:.3f} | Brier={test_brier:.4f} | "
             f"الأساس={test_baseline_brier:.4f})."
         )
-    brain = FusionGBDTBrain(members, usable=has_skill)
+    brain = FusionGBDTBrain(members, usable=True, quality_passed=has_skill)
     gbdt_models[(pair, tf, step)] = brain
     joblib.dump(brain, MODEL_DIR / f"{pair}_{tf}m_c{step}_gbdt.joblib")
+    db = db_connect()
+    db.execute(
+        """
+        INSERT OR REPLACE INTO model_training(
+            pair, timeframe, step_idx, model_version, source_minute_candles,
+            timeframe_candles, training_rows, quality_passed, trained_at
+        ) VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            pair, tf, step, MODEL_VERSION, len(completed_minute_candles(raw)),
+            len(raw_train), len(X), int(has_skill),
+            datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        ),
+    )
+    db.commit()
+    db.close()
 
     dl_bal_txt = "off"
     if TORCH_AVAILABLE and len(d) >= 600:
@@ -890,7 +918,11 @@ def train_tf_step(raw, pair, tf, step):
             add_log(f"⚠️ تعذر تدريب الشبكة العميقة ({tf}د ش{step}): {exc}")
 
     last_train_ts[(pair, tf, step)] = int(raw["ts"].iloc[-1])
-    return f"{tf}د ش{step}: GBDT={top3[0][2]:.3f} DL={dl_bal_txt} أخطاء={mistakes}"
+    return (
+        f"{tf}د ش{step}: GBDT={top3[0][2]:.3f} DL={dl_bal_txt} "
+        f"شموع الفريم={len(raw_train)} صفوف التدريب={len(X)} "
+        f"شموع الدقيقة={len(completed_minute_candles(raw))} أخطاء={mistakes}"
+    )
 
 def _load_gbdt(pair, tf, step):
     k = (pair, tf, step)
@@ -924,6 +956,28 @@ def _load_dl(pair, tf, step):
         except Exception as exc:
             add_log(f"تعذر تحميل نموذج التسلسل {mp.name}: {type(exc).__name__}: {exc}")
     return None
+
+def get_training_summary(pair):
+    c = db_connect()
+    rows = c.execute(
+        """
+        SELECT timeframe, step_idx, source_minute_candles, timeframe_candles,
+               training_rows, quality_passed
+        FROM model_training
+        WHERE pair=? AND model_version=?
+        """,
+        (pair, MODEL_VERSION),
+    ).fetchall()
+    c.close()
+    return {
+        f"{int(tf)}_{int(step)}": {
+            "minute_candles": int(minutes),
+            "timeframe_candles": int(bars),
+            "training_rows": int(samples),
+            "quality_passed": bool(quality),
+        }
+        for tf, step, minutes, bars, samples, quality in rows
+    }
 
 def get_adaptive_engine_weights(pair, tf, step):
     base = {"stat": 0.22, "gbdt": 0.42, "dl": 0.12, "kronos": 0.24}
@@ -968,6 +1022,7 @@ def build_forecast(raw, pair):
     if raw is None or len(raw) < 150:
         return {"ok": False, "note": "بيانات غير كافية"}
     kronos_map = kronos_predict_all(raw, pair)
+    training_summary = get_training_summary(pair)
     tf_cards, all_items, timeframe_summary = {}, [], {}
     for tf in TIMEFRAMES:
         bars = closed_timeframe_bars(raw, tf)
@@ -985,7 +1040,11 @@ def build_forecast(raw, pair):
             gbdt_p = brain.predict_gbdt(row[FEATURES]) if brain is not None else None
             gbdt_status = "غير مدرب"
             if brain is not None:
-                gbdt_status = "مدرب ومشارك" if brain.usable else "مدرب ومرفوض خارج العينة"
+                gbdt_status = (
+                    "مدرب ومشارك واجتاز الاختبار"
+                    if brain.quality_passed
+                    else "مدرب ومشارك؛ أداء الاختبار ضعيف"
+                )
             dl_obj = _load_dl(pair, tf, step)
             dl_p = None
             dl_status = "غير مدرب"
@@ -1018,6 +1077,7 @@ def build_forecast(raw, pair):
                 "stat_prob": stat_p, "gbdt_prob": gbdt_p,
                 "dl_prob": dl_p, "kronos_prob": kr_p,
                 "gbdt_status": gbdt_status, "dl_status": dl_status,
+                "training": training_summary.get(f"{tf}_{step}"),
                 "feature_ts": int(bars["ts"].iloc[-1]),
                 "feature_price": float(bars["close"].iloc[-1]),
             }
@@ -1059,7 +1119,7 @@ def build_forecast(raw, pair):
         "tf_cards": tf_cards, "timeframe_summary": timeframe_summary,
         "all_items": all_items,
         "candles_per_timeframe": MAX_TIMEFRAME_CANDLES,
-        "training_candles": int(min(TRAINING_MINUTE_CANDLES, len(raw))),
+        "training_summary": training_summary,
         "updated_at": datetime.now().strftime("%H:%M:%S"),
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
@@ -1170,8 +1230,8 @@ def save_all_3candle_predictions(fc):
     saved_features = {
         (int(tf), int(step)): int(ts)
         for tf, step, ts in c.execute(
-            "SELECT timeframe, step_idx, MAX(feature_ts) FROM predictions WHERE pair=? AND model_version=? AND feature_ts IS NOT NULL GROUP BY timeframe, step_idx",
-            (fc["pair"], MODEL_VERSION)
+            "SELECT timeframe, step_idx, MAX(feature_ts) FROM predictions WHERE pair=? AND feature_ts IS NOT NULL GROUP BY timeframe, step_idx",
+            (fc["pair"],)
         ).fetchall()
     }
     for it in fc["all_items"]:
@@ -1272,16 +1332,16 @@ def settle_pending_predictions(raw, pair):
 
 def prediction_stats(pair):
     c = db_connect()
-    row = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END), SUM(CASE WHEN hit=0 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND status='SETTLED' AND model_version=?", (pair, MODEL_VERSION)).fetchone()
+    row = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END), SUM(CASE WHEN hit=0 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND status='SETTLED'", (pair,)).fetchone()
     pending = c.execute("SELECT COUNT(*) FROM predictions WHERE pair=? AND status='PENDING' AND model_version=?", (pair, MODEL_VERSION)).fetchone()[0]
     by_tf_step = {}
     for tf in TIMEFRAMES:
         for step in STEPS:
-            r = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED' AND model_version=?", (pair, tf, step, MODEL_VERSION)).fetchone()
+            r = c.execute("SELECT COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE pair=? AND timeframe=? AND step_idx=? AND status='SETTLED'", (pair, tf, step)).fetchone()
             sc, hc = int(r[0] or 0), int(r[1] or 0)
             by_tf_step[f"{tf}_{step}"] = {"settled": sc, "hits": hc, "hit_rate": (100.0 * hc / sc) if sc else None}
     by_pair = []
-    for p, cnt, hits in c.execute("SELECT pair, COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE status='SETTLED' AND model_version=? GROUP BY pair ORDER BY COUNT(*) DESC", (MODEL_VERSION,)).fetchall():
+    for p, cnt, hits in c.execute("SELECT pair, COUNT(*), SUM(CASE WHEN hit=1 THEN 1 ELSE 0 END) FROM predictions WHERE status='SETTLED' GROUP BY pair ORDER BY COUNT(*) DESC").fetchall():
         cnt, hits = int(cnt or 0), int(hits or 0)
         by_pair.append({"pair": p, "settled": cnt, "hits": hits, "hit_rate": (100.0 * hits / cnt) if cnt else None})
     c.close()
@@ -1346,7 +1406,9 @@ def enqueue_training(raw, pair, force=False):
     added = 0
 
     for tf in TIMEFRAMES:
-        tf_bar_count = len(closed_timeframe_bars(raw, tf))
+        tf_bar_count = len(closed_timeframe_bars(
+            raw, tf, limit=MAX_CANDLES_IN_MEMORY
+        ))
         if tf_bar_count < MIN_TIMEFRAME_BARS_FOR_TRAINING:
             continue
         for step in STEPS:
@@ -1455,7 +1517,7 @@ if __name__ == "__main__":
 
     try:
         while not stop_event.is_set():
-            if time.time() - start_ts >= MAX_RUNTIME_SEC:
+            if MAX_RUNTIME_SEC > 0 and time.time() - start_ts >= MAX_RUNTIME_SEC:
                 add_log("انتهاء مدة الجلسة المجدولة.")
                 break
 
