@@ -166,25 +166,32 @@ stop_event = threading.Event()
 train_queue = queue.Queue()
 db_init_lock = threading.Lock()
 db_initialized = False
+TRAIN_WORKERS = 5
+MAX_ACTIVE_PAIRS = 5
 
 # متابعة مهام التدريب ومنع إضافتها أكثر من مرة
 training_jobs = set()
 training_lock = threading.Lock()
 active_training = None
+pair_training_backlog = {}
+pair_training_running = set()
 
 gbdt_models, dl_models = {}, {}
 last_mistake_retrain, last_retrain_ts = {}, {}
 last_train_ts = {}
 
-tg_config = {"enabled": False, "min_conf": 62, "cooldown_min": 60, "candles": ["5_1", "5_2", "5_3"]}
+DEFAULT_TG_CONFIG = {"enabled": False, "min_conf": 62, "cooldown_min": 60, "candles": ["5_1", "5_2", "5_3"]}
+tg_configs = {}
 tg_cooldown_until = {}
-tg_last_info = "لم يتم الإرسال بعد"
+tg_last_info = {}
 
 logs_buffer = deque(maxlen=40)
 pending_sheet_preds = []
 state_lock = threading.Lock()
-latest_forecast = {"ok": False, "note": "جاري تهيئة النظام..."}
 current_pair = DEFAULT_PAIR if DEFAULT_PAIR in FOREX_PAIRS else "EURUSD"
+active_pairs = [current_pair]
+pair_forecasts = {}
+pair_runtime_states = {}
 
 kronos_predictor = None
 kronos_cache = {}  # (pair, last_ts) -> {(tf, step): prob}
@@ -905,23 +912,23 @@ def train_tf_step(raw, pair, tf, step):
         cands["ExtraTrees"] = ExtraTreesClassifier(
             n_estimators=240, max_depth=12, min_samples_leaf=20,
             max_features=0.75, class_weight="balanced", random_state=42,
-            n_jobs=-1
+            n_jobs=1
         )
         cands["RandomForest"] = RandomForestClassifier(
             n_estimators=180, max_depth=10, min_samples_leaf=25,
             max_features=0.75, class_weight="balanced", random_state=42,
-            n_jobs=-1
+            n_jobs=1
         )
         cands["Logistic"] = LogisticRegression(
             C=0.10, max_iter=500, class_weight="balanced", random_state=42
         )
         if CATBOOST_AVAILABLE:
-            cands["CatBoost"] = CatBoostClassifier(iterations=240, depth=6, learning_rate=0.04, l2_leaf_reg=5.0, loss_function="Logloss", auto_class_weights="Balanced", random_seed=42, verbose=0)
+            cands["CatBoost"] = CatBoostClassifier(iterations=240, depth=6, learning_rate=0.04, l2_leaf_reg=5.0, loss_function="Logloss", auto_class_weights="Balanced", random_seed=42, thread_count=1, verbose=0)
         if LIGHTGBM_AVAILABLE:
-            cands["LightGBM"] = LGBMClassifier(n_estimators=220, learning_rate=0.04, num_leaves=31, min_child_samples=25, subsample=0.85, colsample_bytree=0.85, class_weight="balanced", random_state=42, verbosity=-1)
+            cands["LightGBM"] = LGBMClassifier(n_estimators=220, learning_rate=0.04, num_leaves=31, min_child_samples=25, subsample=0.85, colsample_bytree=0.85, class_weight="balanced", random_state=42, n_jobs=1, verbosity=-1)
         if XGBOOST_AVAILABLE:
             pos, neg = max(int(y_ref.sum()), 1), max(int(len(y_ref) - y_ref.sum()), 1)
-            cands["XGBoost"] = XGBClassifier(n_estimators=220, learning_rate=0.04, max_depth=5, subsample=0.85, colsample_bytree=0.85, scale_pos_weight=neg / pos, eval_metric="logloss", random_state=42, n_jobs=-1, verbosity=0)
+            cands["XGBoost"] = XGBClassifier(n_estimators=220, learning_rate=0.04, max_depth=5, subsample=0.85, colsample_bytree=0.85, scale_pos_weight=neg / pos, eval_metric="logloss", random_state=42, n_jobs=1, verbosity=0)
         cands["HistGB"] = HistGradientBoostingClassifier(max_iter=200, learning_rate=0.04, max_leaf_nodes=31, min_samples_leaf=25, l2_regularization=2.0, random_state=42)
         return cands
 
@@ -1370,58 +1377,60 @@ def send_telegram_message(text):
     if not r.get("ok"):
         raise RuntimeError(r.get("description", "فشل إرسال تليجرام"))
 
-def test_telegram_connection():
-    global tg_last_info
+def pair_telegram_config(pair):
+    return tg_configs.get(pair, DEFAULT_TG_CONFIG)
+
+def test_telegram_connection(pair):
     try:
         send_telegram_message(
-            f"✅ اختبار الاتصال ناجح (GitHub Actions)\nالعملة: {current_pair}\nالوقت: {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
+            f"✅ اختبار الاتصال ناجح (GitHub Actions)\nالعملة: {pair}\nالوقت: {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
         )
-        tg_last_info = f"نجح الاختبار الساعة {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
-        add_log("📩 تم إرسال رسالة اختبار التليجرام.")
+        tg_last_info[pair] = f"نجح الاختبار الساعة {datetime.now(CAIRO_TZ).strftime('%H:%M:%S')} بتوقيت القاهرة"
+        add_log(f"📩 تم إرسال رسالة اختبار التليجرام ({pair}).")
     except Exception as exc:
-        tg_last_info = f"فشل الاختبار: {exc}"
-        add_log(f"❌ فشل اختبار التليجرام: {exc}")
+        tg_last_info[pair] = f"فشل الاختبار: {exc}"
+        add_log(f"❌ فشل اختبار التليجرام ({pair}): {exc}")
 
 def maybe_send_telegram(fc, raw):
-    global tg_last_info
     if not fc or not fc.get("ok"):
         return
-    if not tg_config.get("enabled"):
-        tg_last_info = "معطّل (فعّل الخيار واضغط حفظ)"
+    pair = fc["pair"]
+    config = pair_telegram_config(pair)
+    if not config.get("enabled"):
+        tg_last_info[pair] = "معطّل (فعّل الخيار واضغط حفظ)"
         return
-    selected = tg_config.get("candles") or []
+    selected = config.get("candles") or []
     if not selected:
-        tg_last_info = "لم تحدد أي شمعة من الـ 12"
+        tg_last_info[pair] = "لم تحدد أي شمعة من الـ 12"
         return
 
-    pair = fc["pair"]
     now = time.time()
     if now < tg_cooldown_until.get(pair, 0):
         rem = int(tg_cooldown_until[pair] - now)
-        tg_last_info = f"تهدئة ({pair}) — متبقي {max(1, rem // 60)} دقيقة"
+        tg_last_info[pair] = f"تهدئة ({pair}) — متبقي {max(1, rem // 60)} دقيقة"
         return
 
-    min_conf_pct = float(tg_config.get("min_conf", 60))
+    min_conf_pct = float(config.get("min_conf", 60))
     by_key = {it["key"]: it for it in fc.get("all_items", [])}
     missing = [k for k in selected if k not in by_key]
     if missing:
-        tg_last_info = f"بانتظار تدريب: {', '.join(missing)}"
+        tg_last_info[pair] = f"بانتظار تدريب: {', '.join(missing)}"
         return
 
     chosen = [by_key[k] for k in selected]
     dirs = {it["direction"] for it in chosen}
     if len(dirs) != 1:
         summary = " | ".join(f"{it['tf']}د-ش{it['step']}:{it['direction']}" for it in chosen)
-        tg_last_info = f"لا يوجد توافق اتجاه بعد ({summary})"
+        tg_last_info[pair] = f"لا يوجد توافق اتجاه بعد ({summary})"
         return
     common_dir = next(iter(dirs))
     if common_dir not in ("صعود", "هبوط"):
-        tg_last_info = "الشمعات المعلمة في حالة حياد"
+        tg_last_info[pair] = "الشمعات المعلمة في حالة حياد"
         return
 
     min_c_pct = min(round(it["conf"] * 100) for it in chosen)
     if min_c_pct < min_conf_pct:
-        tg_last_info = f"الاتجاه {common_dir} لكن أقل ثقة {min_c_pct}% < المطلوب {int(min_conf_pct)}%"
+        tg_last_info[pair] = f"الاتجاه {common_dir} لكن أقل ثقة {min_c_pct}% < المطلوب {int(min_conf_pct)}%"
         return
 
     dur = estimate_trend_duration(raw, common_dir)
@@ -1433,7 +1442,7 @@ def maybe_send_telegram(fc, raw):
         dur_txt = f"{est_min} دقيقة"
 
     # التحكم في مدة الانتظار قبل الإشعار التالي (0 = تلقائي، >0 = حسب اختيار المستخدم بالدقائق)
-    user_cd = float(tg_config.get("cooldown_min", 0) or 0)
+    user_cd = float(config.get("cooldown_min", 0) or 0)
     wait_min = int(user_cd) if user_cd > 0 else est_min
 
     labels = "، ".join(f"{it['tf']}د-ش{it['step']}" for it in chosen)
@@ -1450,11 +1459,11 @@ def maybe_send_telegram(fc, raw):
         send_telegram_message(msg)
         tg_cooldown_until[pair] = now + wait_min * 60
         until_str = datetime.fromtimestamp(tg_cooldown_until[pair], CAIRO_TZ).strftime("%H:%M:%S")
-        tg_last_info = f"✅ أُرسل {common_dir} ({pair}) | انتظار {wait_min}د حتى {until_str}"
+        tg_last_info[pair] = f"✅ أُرسل {common_dir} ({pair}) | انتظار {wait_min}د حتى {until_str}"
         add_log(f"📩 إشعار تليجرام: {pair} | {common_dir} | انتظار={wait_min}د")
     except Exception as exc:
-        tg_last_info = f"❌ خطأ إرسال: {exc}"
-        add_log(tg_last_info)
+        tg_last_info[pair] = f"❌ خطأ إرسال: {exc}"
+        add_log(tg_last_info[pair])
 
 # ===========================================================================
 # 7. حفظ وتسوية + حلقة العمل
@@ -1565,7 +1574,12 @@ def settle_pending_predictions(raw, pair):
             with training_lock:
                 if k not in training_jobs:
                     training_jobs.add(k)
-                    train_queue.put((raw.copy(), pair, tf, step))
+                    pair_training_backlog.setdefault(pair, []).append(
+                        (raw.copy(), pair, tf, step)
+                    )
+                    if pair not in pair_training_running:
+                        pair_training_running.add(pair)
+                        train_queue.put(pair_training_backlog[pair].pop(0))
     c.close()
 
 def prediction_stats(pair):
@@ -1594,7 +1608,7 @@ def prediction_stats(pair):
 
 
 def train_loop():
-    global latest_forecast, active_training
+    global active_training
 
     while not stop_event.is_set():
         try:
@@ -1632,6 +1646,11 @@ def train_loop():
         finally:
             with training_lock:
                 training_jobs.discard(k)
+                backlog = pair_training_backlog.get(pair)
+                if backlog:
+                    train_queue.put(backlog.pop(0))
+                else:
+                    pair_training_running.discard(pair)
 
             active_training = None
             train_queue.task_done()
@@ -1644,6 +1663,7 @@ def enqueue_training(raw, pair, force=False):
 
     latest_ts = int(raw["ts"].iloc[-1])
     added = 0
+    jobs_to_add = []
     training_summary = get_training_summary(pair) if TORCH_AVAILABLE else {}
 
     for tf in TIMEFRAMES:
@@ -1682,13 +1702,22 @@ def enqueue_training(raw, pair, force=False):
 
                 training_jobs.add(k)
 
-            train_queue.put((raw.copy(), pair, tf, step))
+            jobs_to_add.append((raw.copy(), pair, tf, step))
             added += 1
 
+    with training_lock:
+        backlog = pair_training_backlog.setdefault(pair, [])
+        backlog.extend(jobs_to_add)
+        if backlog and pair not in pair_training_running:
+            pair_training_running.add(pair)
+            train_queue.put(backlog.pop(0))
+
     if added:
+        with training_lock:
+            total_training_jobs = len(training_jobs)
         add_log(
             f"📚 أُضيفت {added} مهمة تدريب | "
-            f"المهام المنتظرة={train_queue.qsize()}"
+            f"المهام النشطة أو المنتظرة={total_training_jobs}"
         )
     else:
         add_log("لا توجد مهام تدريب جديدة مطلوبة")
@@ -1700,18 +1729,39 @@ def push_to_cloud(raw, pair, max_ts, gaps, status_text):
         pending_sheet_preds.clear()
         logs = list(logs_buffer)
     tail = [{"ts": int(r.ts), "close": float(r.close)} for r in raw.tail(50).itertuples()] if raw is not None and not raw.empty else []
-    fc_send = {k: v for k, v in latest_forecast.items() if k != "all_items"} if latest_forecast and latest_forecast.get("ok") else latest_forecast
+    forecast = pair_forecasts.get(pair, {"ok": False, "note": "في انتظار أول توقع"})
+    fc_send = {k: v for k, v in forecast.items() if k != "all_items"} if forecast and forecast.get("ok") else forecast
     cd_left = max(0, int(tg_cooldown_until.get(pair, 0) - time.time()))
+    pair_runtime_states[pair] = {
+        "engine_status": status_text,
+        "pair": pair,
+        "candle_count": int(len(raw)) if raw is not None else 0,
+        "last_candle_str": datetime.fromtimestamp(max_ts, CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S") if max_ts else "—",
+        "gaps": gaps,
+        "forecast": fc_send,
+        "stats": prediction_stats(pair),
+        "tg_status": {
+            "info": tg_last_info.get(pair, "لم يتم الإرسال بعد"),
+            "cooldown_sec": cd_left,
+        },
+        "candles_tail": tail,
+    }
+    states_to_send = {}
+    for state_pair, state in pair_runtime_states.items():
+        if state_pair in active_pairs:
+            states_to_send[state_pair] = state
+    selected_state = pair_runtime_states.get(current_pair, pair_runtime_states[pair])
+    state_payload = dict(selected_state)
+    state_payload.update({
+        "ok": True,
+        "pair": current_pair,
+        "active_pairs": list(active_pairs),
+        "pair_states": states_to_send,
+        "logs": logs,
+    })
     payload = {
         "action": "push_state", "token": SECRET_TOKEN,
-        "state": {
-            "ok": True, "engine_status": status_text, "pair": pair,
-            "candle_count": int(len(raw)) if raw is not None else 0,
-            "last_candle_str": datetime.fromtimestamp(max_ts, CAIRO_TZ).strftime("%Y-%m-%d %H:%M:%S") if max_ts else "—",
-            "gaps": gaps, "forecast": fc_send, "stats": prediction_stats(pair),
-            "tg_status": {"info": tg_last_info, "cooldown_sec": cd_left},
-            "candles_tail": tail, "logs": logs,
-        },
+        "state": state_payload,
         "predictions": preds,
     }
     try:
@@ -1724,17 +1774,28 @@ def push_to_cloud(raw, pair, max_ts, gaps, status_text):
         add_log(f"تعذر الإرسال للسحابة: {exc}")
 
 def poll_cloud_command():
-    global tg_config
+    global active_pairs
     try:
         r = requests.get(
             APPS_SCRIPT_URL,
             params={"action": "poll_command", "token": SECRET_TOKEN, "consume": "1"},
             timeout=12
         ).json()
-        new_cfg = r.get("tg_config")
-        if isinstance(new_cfg, dict) and new_cfg != tg_config:
-            tg_config = new_cfg
-            add_log(f"⚙️ تحديث تليجرام: مفعل={tg_config.get('enabled')} | تهدئة={tg_config.get('cooldown_min')}د")
+        new_configs = r.get("tg_configs")
+        if isinstance(new_configs, dict):
+            tg_configs.update({
+                pair: config for pair, config in new_configs.items()
+                if pair in FOREX_PAIRS and isinstance(config, dict)
+            })
+        cloud_pairs = r.get("active_pairs")
+        if isinstance(cloud_pairs, list):
+            valid_pairs = list(dict.fromkeys(
+                pair.strip().upper() for pair in cloud_pairs
+                if isinstance(pair, str) and pair.strip().upper() in FOREX_PAIRS
+            ))[:MAX_ACTIVE_PAIRS]
+            if valid_pairs and valid_pairs != active_pairs:
+                active_pairs = valid_pairs
+                add_log(f"⚙️ الأزواج النشطة: {', '.join(active_pairs)}")
         return r.get("command")
     except Exception as exc:
         add_log(f"تعذر استطلاع أمر السحابة: {exc}")
@@ -1762,11 +1823,17 @@ if __name__ == "__main__":
         add_log(f"الزوج الافتراضي {DEFAULT_PAIR} غير مدعوم؛ سيستخدم EURUSD.")
 
     start_ts = time.time()
-    threading.Thread(target=train_loop, daemon=True).start()
+    trainer_threads = [
+        threading.Thread(target=train_loop, daemon=True)
+        for _ in range(TRAIN_WORKERS)
+    ]
+    for trainer in trainer_threads:
+        trainer.start()
     c = db_connect()
     api = None
-    last_forecast_key = None
-    last_settlement_key = None
+    initialized_pairs = set()
+    last_forecast_key = {}
+    last_settlement_key = {}
 
     # إرسال فوري للويب منذ الثانية الأولى حتى ترى الحالة الحية
     add_log("🚀 بدء تشغيل المحرك على GitHub Actions...")
@@ -1788,25 +1855,34 @@ if __name__ == "__main__":
                     stop_workflow_continuation()
                     break
                 if cmd.get("test_telegram"):
-                    test_telegram_connection()
+                    requested_pair = cmd.get("pair")
+                    test_pair = requested_pair if requested_pair in FOREX_PAIRS else current_pair
+                    test_telegram_connection(test_pair)
                 requested_pair = cmd.get("pair")
                 if requested_pair:
                     if not isinstance(requested_pair, str) or requested_pair.strip().upper() not in FOREX_PAIRS:
                         add_log(f"رُفض تغيير العملة إلى زوج غير مدعوم: {requested_pair}")
                     elif requested_pair.strip().upper() != current_pair:
                         current_pair = requested_pair.strip().upper()
-                        add_log(f"تغيير الزوج إلى: {current_pair}")
+                        add_log(f"تغيير الزوج المعروض إلى: {current_pair}")
+                requested_pairs = cmd.get("pairs")
+                if isinstance(requested_pairs, list):
+                    clean_pairs = list(dict.fromkeys(
+                        pair.strip().upper() for pair in requested_pairs
+                        if isinstance(pair, str) and pair.strip().upper() in FOREX_PAIRS
+                    ))[:MAX_ACTIVE_PAIRS]
+                    if clean_pairs:
+                        active_pairs = clean_pairs
+                        add_log(f"تحديث الأزواج النشطة: {', '.join(active_pairs)}")
                 if cmd.get("train_now"):
-                    raw = read_candles(c, current_pair)
-                    enqueue_training(raw, current_pair, force=True)
+                    for pair in active_pairs:
+                        enqueue_training(read_candles(c, pair), pair, force=True)
 
             if datetime.now(CAIRO_TZ).weekday() in (5, 6):
                 market_closed_note = "سوق الفوركس مغلق السبت والأحد بتوقيت القاهرة"
-                latest_forecast = {"ok": False, "note": market_closed_note}
-                push_to_cloud(
-                    read_candles(c, current_pair), current_pair, None, 0,
-                    market_closed_note
-                )
+                for pair in active_pairs:
+                    pair_forecasts[pair] = {"ok": False, "note": market_closed_note}
+                    push_to_cloud(read_candles(c, pair), pair, None, 0, market_closed_note)
                 stop_event.wait(60)
                 continue
 
@@ -1824,36 +1900,48 @@ if __name__ == "__main__":
                     api = call_with_timeout(_connect, 25)
                     add_log("✅ اتصال ناجح بـ IQ Option.")
 
-                    load_initial_history(api, c, current_pair)
-                    raw = read_candles(c, current_pair)
-                    enqueue_training(raw, current_pair)
+                for pair in active_pairs:
+                    try:
+                        if pair not in initialized_pairs:
+                            load_initial_history(api, c, pair)
+                            initialized_pairs.add(pair)
+                            enqueue_training(read_candles(c, pair), pair)
 
-                candles = call_with_timeout(lambda: api.get_candles(current_pair, INTERVAL, 60, int(time.time())), 20)
-                n, max_ts = save_candles(c, current_pair, candles)
-                raw = read_candles(c, current_pair)
-                gaps = detect_gaps(raw)
+                        candles = call_with_timeout(
+                            lambda pair=pair: api.get_candles(
+                                pair, INTERVAL, 60, int(time.time())
+                            ),
+                            20,
+                        )
+                        n, max_ts = save_candles(c, pair, candles)
+                        raw = read_candles(c, pair)
+                        gaps = detect_gaps(raw)
 
-                data_key = (current_pair, int(raw.iloc[-1]["ts"])) if not raw.empty else None
-                if data_key is not None and (n > 0 or data_key != last_settlement_key):
-                    settle_pending_predictions(raw, current_pair)
-                    last_settlement_key = data_key
-                if len(raw) >= 150:
-                    forecast_key = data_key
-                    if n > 0 or forecast_key != last_forecast_key:
-                        latest_forecast = build_forecast(raw, current_pair)
-                        last_forecast_key = forecast_key
-                        if latest_forecast.get("ok"):
-                            if n > 0:
-                                save_all_3candle_predictions(latest_forecast)
-                            maybe_send_telegram(latest_forecast, raw)
-                if n > 0:
-                    add_log(f"شموع جديدة={n} | الإجمالي={len(raw)}")
-                    enqueue_training(raw, current_pair)
+                        data_key = (pair, int(raw.iloc[-1]["ts"])) if not raw.empty else None
+                        if data_key is not None and (n > 0 or data_key != last_settlement_key.get(pair)):
+                            settle_pending_predictions(raw, pair)
+                            last_settlement_key[pair] = data_key
+                        if len(raw) >= 150 and (n > 0 or data_key != last_forecast_key.get(pair)):
+                            pair_forecasts[pair] = build_forecast(raw, pair)
+                            last_forecast_key[pair] = data_key
+                            if pair_forecasts[pair].get("ok"):
+                                if n > 0:
+                                    save_all_3candle_predictions(pair_forecasts[pair])
+                                maybe_send_telegram(pair_forecasts[pair], raw)
+                        if n > 0:
+                            add_log(f"{pair}: شموع جديدة={n} | الإجمالي={len(raw)}")
+                            enqueue_training(raw, pair)
 
-                push_to_cloud(
-                    raw, current_pair, max_ts, gaps,
-                    "يعمل ضمن جلسة GitHub Actions المجدولة"
-                )
+                        push_to_cloud(
+                            raw, pair, max_ts, gaps,
+                            "يعمل ضمن جلسة GitHub Actions المجدولة"
+                        )
+                    except Exception as exc:
+                        add_log(f"⚠️ مشكلة في الزوج {pair}: {type(exc).__name__}: {exc}")
+                        if api is not None and not api.check_connect():
+                            api = None
+                        pair_raw = read_candles(c, pair)
+                        push_to_cloud(pair_raw, pair, None, detect_gaps(pair_raw), f"إعادة محاولة: {exc}")
             except Exception as exc:
                 add_log(f"⚠️ مشكلة اتصال مؤقتة: {exc}")
                 api = None
@@ -1861,20 +1949,25 @@ if __name__ == "__main__":
 
             stop_event.wait(15)
     finally:
-        train_queue.put(None)
+        train_queue.join()
+        for _ in trainer_threads:
+            train_queue.put(None)
         train_queue.join()
         stop_event.set()
-        final_raw = read_candles(c, current_pair)
-        if len(final_raw) >= 150:
-            try:
-                latest_forecast = build_forecast(final_raw, current_pair)
-            except Exception as exc:
-                add_log(
-                    f"تعذر تحديث التوقع بعد اكتمال التدريب: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-        push_to_cloud(
-            final_raw, current_pair, None, 0,
-            "تم حفظ التدريب والبيانات؛ بانتظار التشغيل التالي"
-        )
+        for pair in active_pairs:
+            final_raw = read_candles(c, pair)
+            if len(final_raw) >= 150:
+                try:
+                    pair_forecasts[pair] = build_forecast(final_raw, pair)
+                except Exception as exc:
+                    add_log(
+                        f"تعذر تحديث التوقع ({pair}) بعد اكتمال التدريب: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            push_to_cloud(
+                final_raw, pair, None, detect_gaps(final_raw),
+                "تم حفظ التدريب والبيانات؛ بانتظار التشغيل التالي"
+            )
+        for trainer in trainer_threads:
+            trainer.join()
         c.close()
